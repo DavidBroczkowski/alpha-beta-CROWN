@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -13,13 +13,419 @@
 ##                                                                     ##
 #########################################################################
 import time
+from typing import Optional
 import torch
 import arguments
 
 from utils import Timer, convert_history_from_list
-from tensor_storage import TensorStorage
+from tensor_storage import TensorStorage, get_tensor_storage
 from auto_LiRPA.patches import Patches
 from auto_LiRPA.concretize_func import constraints_solving, sort_out_constr_batches, construct_constraints
+from state.traits_mixin import DictLikeMixIn
+from state.intermediate_bounds import update_interm_bounds
+from dataclasses import dataclass
+
+
+@dataclass
+class ClipDecisions(DictLikeMixIn):
+    """A batch of top-k objective indices for clipping.
+
+    Shape: { splitable_layer -> Tensor(batch_size, k) }
+    """
+
+    _data: dict[str, torch.Tensor]
+    topk_objective: int
+
+    def to_device(self, device):
+        ret = ClipDecisions({}, topk_objective=self.topk_objective)
+        items = list(self.items())
+        for k, ten in items:
+            ret[k] = ten.to(device, non_blocking=(k != items[-1][0]))
+        return ret
+
+    @staticmethod
+    def reconstruct_from_masked_result(
+        masked_result: "ClipDecisions",
+        batch_mask_used: torch.Tensor,
+    ) -> "ClipDecisions":
+        ret = ClipDecisions({}, topk_objective=masked_result.topk_objective)
+        for k, ten in masked_result.items():
+            full_ten = torch.zeros(
+                (batch_mask_used.shape[0], ten.shape[1]),
+                dtype=ten.dtype,
+                device=ten.device,
+            )
+            full_ten[batch_mask_used, ...] = ten
+            ret[k] = full_ten
+        return ret
+
+    @staticmethod
+    def reconstruct_from_sub_domain_clip_decisions(
+        sub_domain_clip_decisions: "SubDomainClipDecisions",
+    ) -> "ClipDecisions":
+        """Convert SubDomainClipDecisions to ClipDecisions with expanded domains.
+
+        Reshapes from per-original-domain format to per-split-domain format::
+
+            { splitable_layer -> Tensor(batch_size, 2**split_depth, k) }
+
+        to::
+
+            { splitable_layer -> Tensor(batch_size * 2**split_depth, k) }
+
+        where ``old_tensor[i, j, ...]`` maps to ``new_tensor[i + j * batch_size, ...]``
+        for ``i in [0, batch_size)`` and ``j in [0, 2**split_depth)``.
+        """
+        res = ClipDecisions({}, topk_objective=sub_domain_clip_decisions.topk_objective)
+        num_splits = 2**sub_domain_clip_decisions.split_depth
+        for k, ten in sub_domain_clip_decisions.items():
+            # ten: [batch_size, num_splits, ...]
+            assert ten.shape[0] == sub_domain_clip_decisions.batch_size
+            # Step 1: transpose to [num_splits, batch_size, ...]
+            ten_view = ten.transpose(0, 1).contiguous()
+            # Step 2: reshape to [batch_size * num_splits, ...]
+            ten_new = ten_view.view(
+                sub_domain_clip_decisions.batch_size * num_splits, *ten.shape[2:]
+            )
+            res[k] = ten_new
+        return res
+
+
+@dataclass
+class SubDomainClipDecisions(DictLikeMixIn):
+    """A batch of 2**split_depth sets of top-k objective indices for
+    each subdomain of an original domain.
+
+    The first dimension is indexed by the unsplit (original) domain index.
+
+    Shape: { splitable_layer -> Tensor(batch_size, 2**split_depth, k) }
+    """
+
+    _data: dict[str, torch.Tensor]
+    split_depth: int
+    batch_size: int
+    topk_objective: int
+
+    @classmethod
+    def from_clip_decisions(
+        cls,
+        splitted_domain_clip_decisions: ClipDecisions,
+        split_depth: int,
+        batch_size: int,
+    ) -> "SubDomainClipDecisions":
+        """Convert ClipDecisions to SubDomainClipDecisions.
+
+        Reshapes from per-split-domain format to per-original-domain format::
+
+            { splitable_layer -> Tensor(batch_size * 2**split_depth, k) }
+
+        to::
+
+            { splitable_layer -> Tensor(batch_size, 2**split_depth, k) }
+
+        where ``old_tensor[i + j * batch_size, ...]`` maps to ``new_tensor[i, j, ...]``
+        for ``i in [0, batch_size)`` and ``j in [0, 2**split_depth)``.
+        """
+
+        num_splits = 2**split_depth
+        _data = {}
+
+        for k, ten in splitted_domain_clip_decisions.items():
+            # ten: [batch_size * num_splits, ...]
+            assert ten.shape[0] == batch_size * num_splits
+
+            # Step 1: [num_splits, batch_size, ...]
+            ten_view = ten.view(num_splits, batch_size, *ten.shape[1:])
+
+            # Step 2: transpose to [batch_size, num_splits, ...]
+            ten_new = ten_view.transpose(0, 1).contiguous()
+
+            _data[k] = ten_new
+
+        return cls(
+            _data,
+            split_depth,
+            batch_size,
+            splitted_domain_clip_decisions.topk_objective,
+        )
+
+    @classmethod
+    def reconstruct_from_masked_result(
+        cls,
+        masked_result: "SubDomainClipDecisions",
+        batch_mask_used: torch.Tensor,
+        original_batch_size: int,
+    ) -> "SubDomainClipDecisions":
+        ret = SubDomainClipDecisions(
+            {},
+            split_depth=masked_result.split_depth,
+            batch_size=original_batch_size,
+            topk_objective=masked_result.topk_objective,
+        )
+        for k, ten in masked_result.items():
+            full_ten = torch.zeros(
+                (original_batch_size, ten.shape[1], ten.shape[2]),
+                dtype=ten.dtype,
+                device=ten.device,
+            )
+            full_ten[batch_mask_used, ...] = ten
+            ret[k] = full_ten
+        return ret
+
+    def to_device(self, device):
+        ret = SubDomainClipDecisions(
+            {},
+            split_depth=self.split_depth,
+            batch_size=self.batch_size,
+            topk_objective=self.topk_objective,
+        )
+        items = list(self.items())
+        for k, ten in items:
+            ret[k] = ten.to(device, non_blocking=(k != items[-1][0]))
+        return ret
+
+    def index_select(
+        self,
+        index: torch.Tensor,
+    ) -> "SubDomainClipDecisions":
+        ret = SubDomainClipDecisions(
+            {},
+            split_depth=self.split_depth,
+            batch_size=len(index),
+            topk_objective=self.topk_objective,
+        )
+        for k, ten in self.items():
+            ret[k] = ten[index, ...]
+        return ret
+
+    def narrow_to(self, split_depth: int) -> "SubDomainClipDecisions":
+        if split_depth > self.split_depth:
+            raise ValueError(
+                f"Cannot narrow to larger split_depth {split_depth} > {self.split_depth}."
+            )
+        else:
+            print(f"Narrowing SubDomainClipDecisions from split_depth {self.split_depth} to {split_depth} because DB hold smaller split_depth.")
+        num_split = 2**split_depth
+        ret = SubDomainClipDecisions(
+            {k: ten[:, :num_split, ...] for k, ten in self.items()},
+            split_depth=split_depth,
+            batch_size=self.batch_size,
+            topk_objective=self.topk_objective,
+        )
+        return ret
+
+
+class SubDomainClipDecisionsDB(DictLikeMixIn):
+    """
+    A database to hold SubDomainClipDecisions.
+
+    Can only hold one split_depth at a time.
+
+    traits: { splitable_layer -> TensorStorage }
+
+    """
+
+    def __init__(self):
+        self.current_split_depth = 0
+        self.current_size = 0
+        self.topk_objective = 0
+        self._data: dict[str, TensorStorage] = {}
+
+    def init_by_sub_domain_clip_decisions(
+        self,
+        sub_domain_clip_decisions: SubDomainClipDecisions,
+    ):
+        print(f"SubDomainClipDecisionsDB: (re-)initialized.")
+        self.current_split_depth = sub_domain_clip_decisions.split_depth
+        self.current_size = sub_domain_clip_decisions.batch_size
+        self._data = {}
+        for k, ten in sub_domain_clip_decisions.items():
+            self._data[k] = get_tensor_storage(ten.cpu(), dtype=torch.int64)
+        self.topk_objective = sub_domain_clip_decisions.topk_objective
+
+    def add_clip_decisions(self, sub_domain_clip_decisions: SubDomainClipDecisions):
+        if len(self._data) == 0 and len(sub_domain_clip_decisions.keys()) == 0:
+            return
+
+        split_depth = sub_domain_clip_decisions.split_depth
+        batch_size = sub_domain_clip_decisions.batch_size
+        if split_depth != self.current_split_depth and self.current_size > 0:
+            raise ValueError(
+                "Cannot mix different split_depth in SubDomainClipDecisionsDB."
+            )
+        if self.current_split_depth != split_depth:
+            print(
+                f"SubDomainClipDecisionsDB: from {self.current_split_depth} switch to split_depth {split_depth}."
+            )
+            print(f"SubDomainClipDecisionsDB: old size {batch_size}.")
+            self.current_split_depth = split_depth
+            self.init_by_sub_domain_clip_decisions(sub_domain_clip_decisions)
+            return
+
+        assert self.topk_objective == sub_domain_clip_decisions.topk_objective
+        assert len(set(self.keys()) ^ set(sub_domain_clip_decisions.keys())) == 0
+
+        for k, ten in sub_domain_clip_decisions.items():
+            self[k].append(ten.cpu())
+
+        self.current_size += batch_size
+
+    def pop_obj_idx(self, batch: int):
+        if len(self._data) == 0:
+            return SubDomainClipDecisions(
+                {},
+                split_depth=self.current_split_depth,
+                batch_size=0,
+                topk_objective=self.topk_objective,
+            )
+
+        self.current_size -= batch
+        ret = SubDomainClipDecisions(
+            {k: v.pop(batch) for k, v in self.items()},
+            split_depth=self.current_split_depth,
+            batch_size=batch,
+            topk_objective=self.topk_objective,
+        )
+        return ret
+
+    def determine_narrow(self, sub_domain_clip_decisions: SubDomainClipDecisions):
+        """Determine if sub_domain_clip_decisions needs to be narrowed before inserting.
+
+        Returns:
+            0 if narrowing is not needed, or the target split_depth to narrow to if narrowing is required.
+        """
+        if self.current_size == 0 or len(self._data) == 0:
+            return 0
+        if sub_domain_clip_decisions.split_depth < self.current_split_depth:
+            raise ValueError("Cannot narrow to a smaller split_depth than current_split_depth.")
+        if sub_domain_clip_decisions.split_depth == self.current_split_depth:
+            return 0
+        return self.current_split_depth
+
+class DomainClipScorer:
+    """
+    DomainClipScorer computes the heuristics scores of neurons and 
+    find the top-k objective needed for the domain clip algorithm.
+
+    DomainClipScorer exists to ensure Decision Precompute can
+    compute the same top-k objective as DomainClipScorer.
+    Both parties eventually invoke the `get_clip_decisions_static`
+     function defined in this class.
+
+    It has two usages: 
+    - `DomainClipper` invokes the staticmethod `get_clip_decisions_static`
+      directly, without creating a DomainClipScorer object. 
+    - "Decision Precompute" logics call `compute_clip_decisions` through
+      a DomainClipScorer object. The DomainClipScorer has the same variables
+        with the DomainClipper object for which you want to compute the top-k
+        objectives.
+    """
+
+    def __init__(self, final_name, true_indices, topk_objective: int):
+        """
+        * final_name: The name of the final layer.
+        * true_indices: A dict mapping layer names to the true indices of unstable neurons.
+        """
+        self.final_name = final_name
+        self.true_indices = true_indices
+        self.topk_objective = topk_objective
+        self.score_shapes = {}
+
+    def get_empty_clip_decisions(self, batch_size: int) -> ClipDecisions:
+        if self.score_shapes == {}:
+            return ClipDecisions({}, topk_objective=self.topk_objective)
+        return ClipDecisions(
+            {
+                k: torch.empty((batch_size, self.score_shapes[k]), dtype=torch.long)
+                for k, vten in self.true_indices.items()
+            },
+            topk_objective=self.topk_objective,
+        )
+
+    def update_unstable_idx(self, updated_mask, net):
+        """
+        Update the unstable index by mapping masks to the correct input nodes.
+
+        @params:
+            updated_mask (dict): Dict where keys are operation node names and
+                                values are lists of unstable masks.
+            net: LiRPANet.
+
+        @init:
+            self.true_indices (dict): The mask for each unstable neuron per layer.
+
+        """
+        # Iterate over each operation node and its corresponding list of masks.
+        for op_node_name, mask_list in updated_mask.items():
+            # Find the operation node in the network graph.
+            node = net.net[op_node_name]
+            # Get the names of the input nodes for this operation.
+            input_node_names = [inp.name for inp in node.inputs]
+
+            # Zip the input names with their corresponding masks.
+            for input_name, mask in zip(input_node_names, mask_list):
+                # Skip any masks that are empty.
+                if mask is None or not mask.any():
+                    continue
+
+                # The rest of the logic is the same, but uses the correct
+                # `input_name` as the key `k`.
+                val = mask.to("cpu")
+                true_indices = val.view(-1).nonzero(as_tuple=True)[0]
+                self.true_indices[input_name] = true_indices
+
+    @torch.no_grad()
+    def compute_clip_decisions(self, domains, split_activations):
+        res = self.get_clip_decisions_static(
+            domains,
+            split_activations,
+            self.final_name,
+            self.true_indices,
+            self.topk_objective,
+        )
+
+        if self.score_shapes == {}:
+            for k, v in res.items():
+                self.score_shapes[k] = v.shape[1]
+        return res
+
+    @staticmethod
+    @torch.no_grad()
+    def get_clip_decisions_static(
+        domains, split_activations, final_name, true_indices, topk
+    ) -> ClipDecisions:
+        lbs, ubs, lAs = domains["lower_bounds"], domains["upper_bounds"], domains["lAs"]
+        batch = lbs[final_name].shape[0]
+        # --- Generate Masks (Top-K per layer per batch) ---
+        clip_decisions = ClipDecisions({}, topk_objective=topk)
+        for layer_name in lbs.keys():
+            if layer_name == final_name:
+                continue
+            if layer_name not in true_indices.keys():
+                continue
+            A_key = split_activations[layer_name][0][0].name
+            ratio = (
+                (-lbs[layer_name]).clamp(0, None) * ubs[layer_name].clamp(0, None)
+            ) / (ubs[layer_name] - lbs[layer_name])
+            ratio *= (-lAs[A_key].mean(dim=1)).clamp(0, None)
+            layer_scores = ratio.reshape(batch, -1)
+
+            _, num_neurons = layer_scores.shape
+            # Ensure k is not larger than the number of neurons
+            actual_k = min(topk, num_neurons, len(true_indices[layer_name]))
+            if actual_k > 0:
+                # Get indices of top-k scores for each batch item
+                layer_scores = layer_scores[:, true_indices[layer_name]]
+                _, topk_indices = torch.topk(
+                    layer_scores, k=actual_k, dim=1
+                )  # Shape (batch, k)
+                clip_decisions[layer_name] = topk_indices
+            else:
+                # Handle case with 0 neurons or k=0
+                mask = torch.zeros_like(layer_scores, dtype=torch.bool)
+                clip_decisions[layer_name] = mask[:, true_indices[layer_name]]
+        return clip_decisions
+
 
 class DomainClipper:
     """
@@ -132,7 +538,7 @@ class DomainClipper:
             for k in self.lA.keys():
                 print(f"Layer: {k}")
 
-                #broadcast x_L/x_U along the batch dimension so that we can try out each constraint individually
+                # broadcast x_L/x_U along the batch dimension so that we can try out each constraint individually
                 exp_x_L = x.ptb.x_L.repeat(self.lA[k].shape[1], *[1]*(x.ptb.x_L.ndim - 1))
                 exp_x_U = x.ptb.x_U.repeat(self.lA[k].shape[1], *[1]*(x.ptb.x_U.ndim - 1))
                 test_lA = self.lA[k].transpose(0, 1)
@@ -308,7 +714,7 @@ class DomainClipper:
         final_lbias = torch.stack(lbias_list, dim=0).unsqueeze(1)
 
         return final_lA, final_lbias
-    
+
     def build_final_lA_lbias_all(self, histories):
         """
         Build all lA and lbias for each history using index references.
@@ -397,14 +803,36 @@ class DomainClipper:
             A, bias = self.build_final_lA_lbias(histories)
         return A, bias
 
-    def optimize_interm_bounds(self, domains, x_L, x_U, interm_bounds, split_activations, mask=None, constraints=None):
-        self.timer.start('optimize_interm_bounds')
-
+    def optimize_interm_bounds(
+        self,
+        domains,
+        x_L,
+        x_U,
+        interm_bounds,
+        split_activations,
+        mask=None,
+        constraints=None,
+        clip_decisions_ref: Optional[ClipDecisions] = None,
+    ):
+        self.timer.start("optimize_interm_bounds")
         self.timer.start('get_constraints')
+
         if domains is not None:
             if self.topk_objective > 0:
-                objective_indices = self.get_branching_scores(domains, split_activations, self.topk_objective)
-                print(f"Objective masks generated with topk: {self.topk_objective} objectives.")
+                if clip_decisions_ref is not None:
+                    assert self.topk_objective == clip_decisions_ref.topk_objective
+                    print(
+                        f"Using provided objective masks with topk: "
+                        f"{self.topk_objective} objectives."
+                    )
+                    objective_indices = clip_decisions_ref
+                else:
+                    objective_indices = self.compute_clip_decisions(
+                        domains, split_activations, self.topk_objective
+                    )
+                    print(
+                        f"Objective masks generated with topk: {self.topk_objective} objectives."
+                    )
             else:
                 print("No objective masks generated.")
                 return interm_bounds
@@ -462,12 +890,14 @@ class DomainClipper:
                         lower_bound.add_(lbias),
                         upper_bound.add_(ubias)
                     ]
-                except:
-                    # Naive concretization (doesn't use mask)
-                    new_interm_bounds[keys] = [
-                        concretize_bounds(x_L.flatten(1), x_U.flatten(1), lA, lbias, True),
-                        concretize_bounds(x_L.flatten(1), x_U.flatten(1), uA, ubias, False)
-                    ]
+                # except:
+                #     # Naive concretization (doesn't use mask)
+                #     new_interm_bounds[keys] = [
+                #         concretize_bounds(x_L.flatten(1), x_U.flatten(1), lA, lbias, True),
+                #         concretize_bounds(x_L.flatten(1), x_U.flatten(1), uA, ubias, False)
+                #     ]
+                finally:
+                    pass
 
         return new_interm_bounds
 
@@ -544,7 +974,7 @@ class DomainClipper:
         # Flatten lA's last two dims if needed
         lA = lA.flatten(2)     # shape: [batch, num_constr, input_dim]
         batches, num_constr, input_dim = lA.shape
-        
+
         # Capture the original shape of x_L, x_U
         #   e.g. x_shape might be [batch, c, h, w] or [batch, input_dim].
         x_shape = x_L.shape
@@ -595,34 +1025,10 @@ class DomainClipper:
         )
 
     @torch.no_grad()
-    def get_branching_scores(self, domains, split_activations, topk=50):
-        lbs, ubs, lAs = domains['lower_bounds'], domains['upper_bounds'], domains['lAs']
-        batch = lbs[self.final_name].shape[0]
-        # --- Generate Masks (Top-K per layer per batch) ---
-        objective_indices = {}
-        for layer_name in lbs.keys():
-            if layer_name == self.final_name:
-                continue
-            if layer_name not in self.true_indices.keys():
-                continue
-            A_key = split_activations[layer_name][0][0].name
-            ratio = ((-lbs[layer_name]).clamp(0, None) * ubs[layer_name].clamp(0, None)) / (ubs[layer_name] - lbs[layer_name])
-            ratio *= (-lAs[A_key].mean(dim=1)).clamp(0, None)
-            layer_scores = ratio.reshape(batch, -1)
-
-            _, num_neurons = layer_scores.shape
-            # Ensure k is not larger than the number of neurons
-            actual_k = min(topk, num_neurons, len(self.true_indices[layer_name]))
-            if actual_k > 0:
-                # Get indices of top-k scores for each batch item
-                layer_scores = layer_scores[:, self.true_indices[layer_name]]
-                _, topk_indices = torch.topk(layer_scores, k=actual_k, dim=1) # Shape (batch, k)
-                objective_indices[layer_name] = topk_indices
-            else:
-                # Handle case with 0 neurons or k=0
-                mask = torch.zeros_like(layer_scores, dtype=torch.bool)
-                objective_indices[layer_name] = mask[:, self.true_indices[layer_name]]
-        return objective_indices
+    def compute_clip_decisions(self, domains, split_activations, topk=50):
+        return DomainClipScorer.get_clip_decisions_static(
+            domains, split_activations, self.final_name, self.true_indices, topk
+        )
 
     def get_stop_criterion_and_iter(self, stop_func, iter_idx):
         self.stop_func = stop_func
@@ -632,7 +1038,7 @@ def prune_d(mask, d):
     # Convert the boolean mask to indices once.
     mask_idx = torch.nonzero(mask, as_tuple=False).view(-1)
     if len(mask_idx) == 0:
-        return
+        return d
     mask_list = mask_idx.tolist()  # For iterating in list comprehensions.
     max_idx = mask_idx.max().item() + 1
 
@@ -710,7 +1116,7 @@ def _all_dist(pts, lA, lbias):
     numerator = torch.einsum('bmn,bn->bm', lA, pts) + lbias
     denominator = torch.norm(lA, dim=2)
     return (numerator / (denominator + 1e-10)).unsqueeze(-1)
-    
+
 def dimensionwise_shrinkage_stats(x_L, x_U, x_L_new, x_U_new, eps=1e-12):
     """
     Compare old and new bounding boxes in high-dim by computing dimension-wise
@@ -813,109 +1219,3 @@ def expand_x_batch(x_L, x_U, x_shape, batches):
     x_shape = x_L.shape  # Update shape, now shape[0] == batches
 
     return x_L, x_U, x_shape
-
-def update_interm_bounds(interm_bounds,
-                        new_interm_bounds,
-                        final_name,
-                        unstable_mask,
-                        prune_mask=None,
-                        verbose=False):
-    """
-    Update each lb tensor in lb_dict based on some new_interm_bounds,
-    optionally pruning along the batch dimension via prune_mask.
-
-    @params:
-        interm_bounds : dict
-            key: Each layer's name
-            value: a list
-                v[0]: lb with shape [batch, input_dim]
-                v[1]: ub with shape [batch, input_dim]
-
-        new_interm_bounds : dict
-            key: same layer names as above
-            value: a list
-                v[0]: lb with shape [batch, num_unstable_neurons]
-                v[1]: ub with shape [batch, num_unstable_neurons]
-
-        prune_mask : torch.BoolTensor or None
-            A boolean mask of shape [batch]. If provided, we only keep 
-            the rows where prune_mask == True.
-
-    @return:
-        updated_interm_bounds: A dict with same structure as interm_bounds
-                            but updated (and optionally pruned).
-    """
-    updated_interm_bounds = {}
-    for key in interm_bounds.keys():
-        # 1) If it's the final layer, or if new_interm_bounds doesn't have it, just copy over
-        if key == final_name or key not in new_interm_bounds.keys():
-            updated_interm_bounds[key] = interm_bounds[key]
-            continue
-
-        # 2) Extract lb/ub from both dictionaries
-        lb, ub = interm_bounds[key]
-        some_lb, some_ub = new_interm_bounds[key]
-
-        # ---------------------------------------------------
-        # 3) PRUNE BATCH if a prune_mask is provided
-        # ---------------------------------------------------
-        if prune_mask is not None:
-            lb = lb[prune_mask]           # shape: [new_batch, input_dim]
-            ub = ub[prune_mask]           # shape: [new_batch, input_dim]
-
-        # 4) The "mask" in self.mask[key] is usually about neuron indices (columns), not the batch.
-        #    e.g. mask might indicate which neurons are "unstable" to be updated.
-        mask = unstable_mask[key]  # Typically a boolean or index list for columns
-
-        # Safety check
-        if mask.sum().item() != some_lb.size(1):
-            print(f'Warning: Key {key} has mismatch: mask size={mask.sum().item()}, some_lb size={some_lb.size()}')
-            # If mismatch, just keep original (already pruned) lb/ub
-            updated_interm_bounds[key] = [lb, ub]
-            continue
-
-        # 5) Slice the columns (neurons) out from lb and ub
-        #    Here mask is presumably shape [num_neurons] or something like that
-        lb_masked = lb[:, mask[0]]  # shape: [new_batch, N]
-        ub_masked = ub[:, mask[0]]
-
-        if isinstance(lb_masked, TensorStorage):
-            lb_masked = lb_masked.tensor()
-            ub_masked = ub_masked.tensor()
-
-        if isinstance(some_lb, TensorStorage):
-            some_lb = some_lb.tensor()
-            some_ub = some_ub.tensor()
-
-        some_lb = some_lb.to(lb_masked.device)
-        some_ub = some_ub.to(ub_masked.device)
-
-        # 6) Compute better bounds
-        lb_best = torch.maximum(lb_masked, some_lb)  # shape: [new_batch, N]
-        ub_best = torch.minimum(ub_masked, some_ub)
-
-        # 7) Write back the improved lb/ub into the original (pruned) lb/ub
-        lb[:, mask[0]] = lb_best
-        ub[:, mask[0]] = ub_best
-
-        if verbose:
-            # 8) Collect some stats
-            lb_diff = lb_best - lb_masked
-            ub_diff = ub_best - ub_masked
-            #  new batch size after pruning
-            new_batch_size = lb.size(0)
-            if new_batch_size > 0:
-
-                lb_num_improved = (lb_diff > 0).sum().item() / new_batch_size
-                ub_num_improved = (ub_diff < 0).sum().item() / new_batch_size
-
-                lb_improved = lb_diff.sum().item() / new_batch_size
-                ub_improved = ub_diff.sum().item() / new_batch_size
-
-                print(f' layer: {key}')
-                print(f'    lower bounds improved: average # {lb_num_improved}, value {lb_improved}')
-                print(f'    upper bounds improved: average # {ub_num_improved}, value {ub_improved}')
-        # 9) Save updated (and pruned) lb, ub
-        updated_interm_bounds[key] = [lb, ub]
-
-    return updated_interm_bounds

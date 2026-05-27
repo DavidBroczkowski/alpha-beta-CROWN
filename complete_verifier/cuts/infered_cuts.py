@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -22,7 +22,10 @@ from auto_LiRPA.utils import stop_criterion_batch_any, multi_spec_keep_func_all
 from cuts.cut_utils import fetch_cut_from_cplex, cut_analysis
 
 import arguments
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+from cuts.cplex_cut_recorder import CplexCutRecorder
+from state import AlphaValueData, BetaFullData, NumsEffectiveBetasPerDomain
+
 if TYPE_CHECKING:
     from beta_CROWN_solver import LiRPANet
 
@@ -83,7 +86,15 @@ class BICCOS:
         self.lb_init = {self.key_mapping[key]: value for key, value in ret['lower_bounds'].items()}
         self.ub_init = {self.key_mapping[key]: value for key, value in ret['upper_bounds'].items()}
 
-    def update_cut(self, d, net, ret, enforce_usage, domain_visited, heuristic=None, iter_idx=None):
+    def update_cut(self,
+        d,
+        net,
+        ret,
+        enforce_usage,
+        domain_visited,
+        heuristic=None,
+        iter_idx=None,
+        recorder: Optional[CplexCutRecorder] = None,):
         '''
         Main function to update the cuts.
         d: the dictionary contains the histories, bounds, betas, etc.
@@ -101,9 +112,8 @@ class BICCOS:
         ret: the return value of the bound_update() function in beta crown solver
             {
             'lower_bounds': ret_l, 'upper_bounds': ret_u,
-            'lAs': lAs, 'alphas': ret_s,
-            'betas': ret_b, 'split_history': new_split_history,
-            'intermediate_betas': best_intermediate_betas,
+            'lAs': lAs, 'alphas': ret_alphas,
+            'betas': ret_betas, 'split_history': new_split_history,
             'primals': primal_x,
             'c': c, 'x_Ls': x_Ls, 'x_Us': x_Us,
             'input_split_idx': input_split_idx,
@@ -136,12 +146,20 @@ class BICCOS:
             if domain_visited < self.max_domain or enforce_usage:
 
                 # calculate the neuron influence score for all cases
-                if heuristic == 'neuron_influence_score':
-                    self.neuron_influence_score_cal(d['history'], d['lower_bounds'][self.final_name].to('cpu'), lbs_final)
-                elif heuristic == 'random_drop':
-                    print('Warning: Random drop heuristic used, performance may be bad.')
-                elif heuristic == 'sparse_opt':
-                    raise NotImplementedError('Sparse Optimization Heuristic is not implemented yet.')
+                if heuristic == "neuron_influence_score":
+                    self.neuron_influence_score_cal(
+                        d["history"],
+                        d["lower_bounds"][self.final_name].to(lbs_final.device),
+                        lbs_final,
+                    )
+                elif heuristic == "random_drop":
+                    print(
+                        "Warning: Random drop heuristic used, performance may be bad."
+                    )
+                elif heuristic == "sparse_opt":
+                    raise NotImplementedError(
+                        "Sparse Optimization Heuristic is not implemented yet."
+                    )
 
                 if self.inference_condition(lbs_final) or (enforce_usage and (lbs_final > self.decision_thresh).any()):
                     inference_time = time.time() # record the preprocessing time
@@ -174,7 +192,9 @@ class BICCOS:
 
         # synchronize the cuts to the solver
         if self.cplex_cuts_usage:
-            new_cplex_cuts, cut_timestamp = fetch_cut_from_cplex(net, sync_to_net=False)
+            new_cplex_cuts, cut_timestamp = fetch_cut_from_cplex(
+                net, sync_to_net=False, recorder=recorder
+            )
             if new_cplex_cuts is not None:
                 self.cplex_cuts = new_cplex_cuts
 
@@ -636,8 +656,10 @@ def biccos_verification(self: 'LiRPANet', d, beta=True,
     if beta:
         if self.net.cut_used:
             self.disable_cut_for_branching()
-        splits_per_example = self.set_beta(d, bias=None)
-        
+        # nums_effective_beta_per_domain = self.beta_set_net_from_d(d, bias=False)
+        beta_full_data, nums_effective_beta_per_domain = BetaFullData.from_domain_dict(d, bias=False, device=self.device)
+        beta_full_data.attach_to_net(self)
+
         self.net.cut_used = (
                         arguments.Config['bab']['cut']['enabled']
                         and arguments.Config['bab']['cut']['bab_cut']
@@ -646,10 +668,12 @@ def biccos_verification(self: 'LiRPANet', d, beta=True,
         if self.net.cut_used:
             iteration = self.set_cut_params(
                     batch, batch, d.get('split_history', None))
+    else:
+        nums_effective_beta_per_domain = ValueError("beta flag is not on")
 
     ret = self._expand_tensors(d, batch)
     interm_bounds, lb_last, _, c, new_x, _, _ = ret
-    self.set_alpha(d['alphas'], set_all=enable_opt_interm_bounds)
+    AlphaValueData.from_domain_dict(d).attach_to_net(self)
 
     if beta:
         self.set_crown_bound_opts('beta')
@@ -691,18 +715,18 @@ def biccos_verification(self: 'LiRPANet', d, beta=True,
     ub = torch.full_like(lb, fill_value=torch.inf, device='cpu')  # dummy upper bound
 
     with torch.no_grad():
-        # Move tensors to CPU for all elements in this batch.
-        lb = lb.to(device='cpu')
-        #ret_s = self.get_alpha(device='cpu')
+        #ret_alphas = self.get_alpha(device='cpu')
         if beta:
-            ret_b = self.get_beta(splits_per_example, device='cpu')
+            # ret_betas = self.beta_get_from_net(nums_effective_beta_per_domain, device="cpu")
+            assert not isinstance(nums_effective_beta_per_domain, ValueError)
+            full_beta_info = BetaFullData.from_net(self, nums_effective_beta_per_domain[0].keys())
+            ret_betas = full_beta_info.to_domain_dict(nums_effective_beta_per_domain, device="cpu")
         else:
-            ret_b = None
+            ret_betas = [{} for _ in range(batch)]
 
         # Reorganize tensors.
-        ret_l, _, _ = self.get_candidate_parallel(lb, ub, device='cpu')
-        ret_l[self.final_name] = torch.max(ret_l[self.final_name], lb_last.cpu())
+        ret_l = {self.final_name: torch.max(lb, lb_last).cpu()}
 
     return {
-            'lower_bounds': ret_l, 'betas': ret_b,
+            'lower_bounds': ret_l, 'betas': ret_betas,
         }

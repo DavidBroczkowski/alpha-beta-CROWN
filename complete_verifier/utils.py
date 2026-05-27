@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -17,17 +17,59 @@ import copy
 import os
 import time
 import pickle
+from typing import Any, Iterable
 import arguments
-from dataclasses import dataclass
 from collections import defaultdict
 from string import Template
 import torch
 import torch.nn.functional as F
+import inspect
+
 
 from auto_LiRPA import BoundedTensor
 from auto_LiRPA.perturbations import PerturbationLpNorm
 
-@dataclass
+from domain_utils import DomainDB
+
+
+def _source_mentions_jacobian_op(obj: Any) -> bool:
+    """Best-effort detection of JacobianOP references in Python callables/types."""
+    code = getattr(obj, '__code__', None)
+    if code is not None and 'JacobianOP' in getattr(code, 'co_names', ()):
+        return True
+    try:
+        source = inspect.getsource(obj)
+    except (OSError, TypeError):
+        return False
+    return 'JacobianOP' in source or 'grad::jacobian' in source
+
+
+def model_uses_jacobian_op(model: Any) -> bool:
+    """Detect whether a torch module implementation references JacobianOP."""
+    if not isinstance(model, torch.nn.Module):
+        return False
+    seen_types: set[type] = set()
+    for module in model.modules():
+        module_type = type(module)
+        if module_type in seen_types:
+            continue
+        seen_types.add(module_type)
+        if _source_mentions_jacobian_op(module_type):
+            return True
+        forward = getattr(module_type, 'forward', None)
+        if forward is not None and _source_mentions_jacobian_op(forward):
+            return True
+    return False
+
+
+def auto_enable_jacobian_mode(config: dict[str, Any], model: Any) -> bool:
+    """Enable model/with_jacobian when JacobianOP is detected in the model."""
+    model_cfg = config.setdefault('model', {})
+    if model_uses_jacobian_op(model):
+        model_cfg['with_jacobian'] = True
+        return True
+    return bool(model_cfg.get('with_jacobian', False))
+
 class Timer:
     total_func_time: float = 0.0
     total_prepare_time: float = 0.0
@@ -124,7 +166,7 @@ class Logger:
 
                 with open(arguments.Config['general']['output_file'], 'wb') as f:
                     pickle.dump(arguments.Globals['out'], f)
-                print(f"Result dict saved to {arguments.Config['general']['output_file']}.")
+                print(f'Result dict saved to {arguments.Config["general"]["output_file"]}.')
 
         else:
             if time.time() - self.start_time > self.timeout_threshold:
@@ -219,7 +261,7 @@ class Logger:
 
                 with open(arguments.Config['general']['output_file'], 'wb') as f:
                     pickle.dump(arguments.Globals['out'], f)
-                print(f"Result dict saved to {arguments.Config['general']['output_file']}.")
+                print(f'Result dict saved to {arguments.Config["general"]["output_file"]}.')
 
     def _save(self):
         with open(self.save_path, 'wb') as f:
@@ -234,7 +276,15 @@ class Stats:
     def __init__(self):
         self.visited = 0
         self.timer = Timer()
+        self.domainDB = DomainDB.new_db()
+
+        # TODO: Remove me
+        # these member variables are used to indicate exit result of
+        # all_node_split_LP cases. However, we should not use stats
+        # to indicate such information.
+        self.all_split_result = False
         self.all_node_split = False
+        self.counterexample = None
 
 
 def get_reduce_op(op, with_dim=True):
@@ -289,17 +339,24 @@ def convert_history_from_list(history):
             torch.tensor(history[3]),
             torch.tensor(history[4]))
 
-def print_splitting_decisions(net, d, split_depth, split, verbose=False):
+
+def print_splitting_decisions_impl(
+    layer_index_to_name,
+    d_lowerbounds,
+    d_upperbounds,
+    split_depth,
+    split,
+    verbose=False,
+):
     """Print the first two split for first 10 domains."""
     print('splitting decisions: ')
     branching_decision = split['decision']
-    batch = next(iter(d['lower_bounds'].values())).shape[0]
+    batch = next(iter(d_lowerbounds.values())).shape[0]
     for l in range(split_depth):
         print(f'split level {l}', end=': ')
         for b in range(min(10, batch)):
             decision = branching_decision[l*batch + b]
-            print(f'[{net.split_nodes[decision[0]].name}, {decision[1]}]',
-                  end=' ')
+            print(f'[{layer_index_to_name[decision[0]]}, {decision[1]}]', end=' ')
         print('')
         if verbose:
             if 'points' in split and split['points'] is not None:
@@ -307,11 +364,14 @@ def print_splitting_decisions(net, d, split_depth, split, verbose=False):
                 for b in range(min(50, batch)):
                     idx = l * batch + b
                     decision = branching_decision[l*batch + b]
-                    node = net.split_nodes[decision[0]]
-                    print('[{:.4f}, {:.4f}]'.format(
-                        d['lower_bounds'][node.name][idx].view(-1)[decision[1]],
-                        d['upper_bounds'][node.name][idx].view(-1)[decision[1]]),
-                        end=' ')
+                    node_name = layer_index_to_name[decision[0]]
+                    print(
+                        '[{:.4f}, {:.4f}]'.format(
+                            d_lowerbounds[node_name][idx].view(-1)[decision[1]],
+                            d_upperbounds[node_name][idx].view(-1)[decision[1]],
+                        ),
+                        end=' ',
+                    )
                     print('branched at', end=' ')
                     if split['points'].ndim == 1:
                         print('{:.4f}'.format(split['points'][idx]))
@@ -319,6 +379,19 @@ def print_splitting_decisions(net, d, split_depth, split, verbose=False):
                         for i in range(split['points'].shape[-1]):
                             print('{:.4f}'.format(split['points'][idx][i]), end=' ')
                         print()
+
+# note: To be removed after `split_domain` refactored.
+# Oughtn't to be a member function of LiRPANet.
+# Keep here for backward compatibility.
+def print_splitting_decisions(net, d, split_depth, split, verbose=False):
+    print_splitting_decisions_impl(
+        [n.name for n in net.split_nodes],
+        d['lower_bounds'],
+        d['upper_bounds'],
+        split_depth,
+        split,
+        verbose=verbose,
+    )
 
 
 def check_infeasible_bounds(lower, upper, reduce=False):
@@ -630,7 +703,7 @@ def pad_list_of_input_to_tensor(
     return padded_tensor
 
 
-def transfer_obj(obj, device=None, dtype=None, inplace=False):
+def transfer_obj(obj, device=None, dtype=None, inplace=False, non_blocking=False):
     """
     Move all tensors in the object to a specified dest
     (device or dtype). The inplace=True option is available for dict.
@@ -639,17 +712,69 @@ def transfer_obj(obj, device=None, dtype=None, inplace=False):
         return obj
     elif isinstance(obj, torch.Tensor):
         return obj.to(device=device if device is not None else obj.device,
-                      dtype=dtype if dtype is not None else obj.dtype)
+                      dtype=dtype if dtype is not None else obj.dtype,
+                      non_blocking=non_blocking)
     elif isinstance(obj, tuple):
-        return tuple([transfer_obj(item, device=device, dtype=dtype) for item in obj])
+        return tuple([transfer_obj(item, device=device, dtype=dtype,
+                                   non_blocking=non_blocking) for item in obj])
     elif isinstance(obj, list):
-        return [transfer_obj(item, device=device, dtype=dtype) for item in obj]
+        return [transfer_obj(item, device=device, dtype=dtype,
+                             non_blocking=non_blocking) for item in obj]
     elif isinstance(obj, dict):
         if inplace:
             for k, v in obj.items():
-                obj[k] = transfer_obj(v, device=device, dtype=dtype, inplace=True)
+                obj[k] = transfer_obj(v, device=device, dtype=dtype, inplace=True,
+                                      non_blocking=non_blocking)
             return obj
         else:
-            return {k: transfer_obj(v, device=device, dtype=dtype) for k, v in obj.items()}
+            return {k: transfer_obj(v, device=device, dtype=dtype,
+                                    non_blocking=non_blocking) for k, v in obj.items()}
     else:
         return obj
+
+
+def assert_allowed_caller(allowed: Iterable[str]) -> bool:
+    """
+    Assert the caller function is in the allowed set.
+    """
+    frame = inspect.currentframe()
+    assert frame is not None
+    try:
+        # frame: assert_allowed_caller
+        callee_frame = frame.f_back
+        if callee_frame is None:
+            raise AssertionError('No callee frame found')
+
+        caller_frame = callee_frame.f_back
+        if caller_frame is None:
+            raise AssertionError('No caller frame found')
+
+        caller_name = caller_frame.f_code.co_name
+    except Exception:
+        caller_name = '<unknown>'
+
+    finally:
+        del frame
+
+    if caller_name not in allowed:
+        print(f'Invalid caller {caller_name!r}; allowed callers are {sorted(allowed)}')
+        return False
+    return True
+
+
+def count_tensor_bytes(obj):
+    """
+    Count the total memory bytes used by all tensors in the object.
+    """
+    if obj is None:
+        return 0
+    elif isinstance(obj, torch.Tensor):
+        return obj.numel() * obj.element_size()
+    elif isinstance(obj, tuple):
+        return sum(count_tensor_bytes(item) for item in obj)
+    elif isinstance(obj, list):
+        return sum(count_tensor_bytes(item) for item in obj)
+    elif isinstance(obj, dict):
+        return sum(count_tensor_bytes(v) for v in obj.values())
+    else:
+        return 0

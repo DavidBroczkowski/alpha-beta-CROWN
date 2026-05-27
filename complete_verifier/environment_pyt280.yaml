@@ -8,6 +8,7 @@
 # conda install numpy protobuf pyyaml appdirs sortedcontainers packaging psutil tqdm pandas pytest pre-commit mpmath pygments rich scikit-learn scipy graphviz python-graphviz
 # pip install onnx onnxruntime onnxoptimizer onnxsim skl2onnx
 # pip install --no-deps git+https://github.com/Verified-Intelligence/onnx2pytorch.git
+# pip install ray==2.54.0
 
 channels:
   - gurobi
@@ -132,6 +133,7 @@ dependencies:
   - pycparser=2.23=py311h06a4308_0
   - pygments=2.19.2=py311h06a4308_0
   - pytest=8.4.2=py311h06a4308_0
+  - pytest-cov=7.0.0=py311h06a4308_0  
   - python=3.11.14=h6fa692b_0
   - python-dateutil=2.9.0post0=py311h06a4308_2
   - python-graphviz=0.16=pyhd3eb1b0_1
@@ -204,6 +206,7 @@ dependencies:
       - onnxruntime==1.23.2
       - onnxsim==0.4.36
       - pillow==11.3.0
+      - ray==2.54.0
       - skl2onnx==1.19.1
       - sympy==1.14.0
       - torch==2.8.0+cu128

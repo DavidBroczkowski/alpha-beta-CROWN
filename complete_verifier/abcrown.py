@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -28,7 +28,7 @@ from jit_precompile import precompile_jit_kernels
 from beta_CROWN_solver import LiRPANet
 from lp_mip_solver import mip
 from attack import attack, reset_attack_stats, get_attack_stats
-from utils import Logger
+from utils import Logger, auto_enable_jacobian_mode
 from specifications import vnnlibHandler
 from incomplete_verifier_func import SpecHandler
 from loading import load_model_and_vnnlib, parse_run_mode, Customized  # pylint: disable=unused-import
@@ -193,6 +193,8 @@ class ABCROWN:
             data_min = vnnlib_handler.data_min[0:1].to(device)
             data_max = vnnlib_handler.data_max[0:1].to(device)
             model_ori = model_ori.eval().to(device)
+            auto_enable_jacobian_mode(arguments.Config.all_args, model_ori)
+            arguments.Config.update_arguments()
             if arguments.Config['general']['adhoc_tuning']:
                 eval(   # pylint: disable=eval-used
                     arguments.Config['general']['adhoc_tuning'])(model_ori, vnnlib_handler)
@@ -253,7 +255,11 @@ class ABCROWN:
 
             verified_status, verified_success = 'unknown', False
 
-            if arguments.Config['attack']['pgd_order'] == 'before':
+            if (arguments.Config['attack']['pgd_order'] == 'before'
+                # TODO: for simplicity, I disabled intial attack check,
+                #   but this control logic should be treat more meticulously.
+                #   e.g. pgd_order should be 'skip', then set to be 'after' in bab.
+                and not arguments.Config['solving']['solving_mode']):
                 (verified_status, verified_success, attack_examples,
                  attack_margins, all_adv_candidates) = self.attack(
                     model_ori, verified_status, verified_success)
@@ -274,6 +280,7 @@ class ABCROWN:
                     print(f'Verified success: {verified_success} -> False')
                     print(f'Verified success: {verified_status} -> \'unknown\'')
 
+                    arguments.Globals['sanity_check_offset'] = rhs_offset
                     vnnlib_handler.add_rhs_offset(rhs_offset)
                     arguments.Config['attack']['pgd_order'] = 'skip'
                     verified_status, verified_success = 'unknown', False
@@ -309,7 +316,12 @@ class ABCROWN:
                 verified_success = verified_status != 'unknown'
                 model_incomplete = ret.get('model', None)
 
-            if not verified_success and arguments.Config['attack']['pgd_order'] == 'after':
+            if (not verified_success
+                and arguments.Config['attack']['pgd_order'] == 'after'
+                # TODO: for simplicity, I disabled intial attack check,
+                #   but this control logic should be treat more meticulously.
+                #   e.g. pgd_order should be 'skip', then set to be 'after' in bab.
+                and not arguments.Config['solving']['solving_mode']):
                 (verified_status, verified_success, attack_examples,
                  attack_margins, all_adv_candidates) = self.attack(
                     model_ori, verified_status, verified_success)
@@ -363,7 +375,8 @@ class ABCROWN:
             if (bab_args['cut']['enabled'] and bab_args['cut']['cplex_cuts']
                     and model_incomplete is not None):
                 terminate_mip_processes(
-                    model_incomplete.mip_building_proc, model_incomplete.processes
+                    model_incomplete.mip_building_proc, model_incomplete.processes,
+                    watch_dog_proc=model_incomplete.get_cuts_watch_dog_proc,
                 )
                 del model_incomplete.processes
 
@@ -382,6 +395,13 @@ class ABCROWN:
             self.logger.summarize_results(verified_status, new_idx)
             # At the end of each test instance, record attack statistics
             get_attack_stats(self.logger, new_idx)
+
+        # if it is prepare only, skip.
+        if arguments.Config['general']['prepare_only']:
+            print()
+            print('############# Summary #############')
+            print('Preparation only, skipping summarization.')
+            return {}
 
         self.logger.finish()
         return self.logger.verification_summary

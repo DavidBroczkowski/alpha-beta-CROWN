@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -20,8 +20,17 @@ from heuristics.fsb import FsbBranching
 from heuristics.kfsb import KfsbBranching
 from heuristics.nonlinear import NonlinearBranching
 
+BranchingHeuristicObj = (
+    RandomNeuronBranching
+    | InterceptBranching
+    | NonlinearBranching
+    | BabsrBranching
+    | FsbBranching
+    | KfsbBranching
+)
 
-def get_branching_heuristic(net, method=None):
+
+def get_branching_heuristic(net, method=None) -> BranchingHeuristicObj:
     if method is None:
         branching_method = arguments.Config['bab']['branching']['method']
     else:

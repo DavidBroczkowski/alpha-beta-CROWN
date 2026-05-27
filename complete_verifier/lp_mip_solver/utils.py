@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -23,6 +23,8 @@ import multiprocessing
 import numpy as np
 import gurobipy as grb
 import arguments
+import ctypes
+import signal
 
 try:
     from scip_model import SCIPModel, EarlyStopEvent, GenerateCutsEvent
@@ -464,3 +466,25 @@ def check_optimization_success(model, introduced_constrs_all=None):
         print('\n')
         print(f'Gurobi model.status: {model.status}\n')
         raise NotImplementedError
+
+def _set_pdeathsig():
+    """Ask the kernel to send SIGTERM to this process when its parent dies. 
+    Linux-only; silently skipped on other platforms.
+    """
+    if sys.platform != "linux":
+        return
+    PR_SET_PDEATHSIG = 1
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        result = libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        if result != 0:
+            errno = ctypes.get_errno()
+            print(
+                f"Warning: prctl(PR_SET_PDEATHSIG) failed with errno {errno}: {os.strerror(errno)}",
+                file=sys.stderr,
+            )
+    except OSError as exc:
+        print(
+            f"Warning: unable to set PR_SET_PDEATHSIG via prctl: {exc}",
+            file=sys.stderr,
+        )

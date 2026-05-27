@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -24,11 +24,17 @@ import multiprocessing
 import gurobipy as grb
 
 import arguments
+from state import WorkingIntermBoundsInfo
 from auto_LiRPA.beta_crown import SparseBeta
 from auto_LiRPA.bound_ops import BoundLinear, BoundConv, BoundBatchNormalization, BoundAdd
 from auto_LiRPA.utils import stop_criterion_min, reduction_str2func
 
 from .utils import clamp, handle_gurobi_error
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from beta_CROWN_solver import LiRPANet
 
 
 multiprocess_mip_model = None
@@ -36,9 +42,15 @@ mip_refine_time_start = None
 mip_refine_timeout = 230
 
 
-def build_the_model_mip_refine(m, lower_bounds, upper_bounds,
-            stop_criterion_func=stop_criterion_min(1e-4), score=None, FSB_sort=True,
-            topk_filter=1.):
+def build_the_model_mip_refine(
+    m: "LiRPANet",
+    lower_bounds,
+    upper_bounds,
+    stop_criterion_func=stop_criterion_min(1e-4),
+    score=None,
+    FSB_sort=True,
+    topk_filter=1.0,
+):
     """
     Before the first branching, we build the model and create a mask matrix
     Output: relu_mask, current intermediate upper and lower bounds, a list of
@@ -136,7 +148,7 @@ def build_the_model_mip_refine(m, lower_bounds, upper_bounds,
     final_alpha_crown_needed = True
     init_relu = 0
     device = m.net.device
-    # This variable is to record whether an early stop action happened in the compute_bounds function. 
+    # This variable is to record whether an early stop action happened in the compute_bounds function.
     early_stop = True
     unstable_neuron_filter = torch.tensor([])
     A_dict_ = {}
@@ -198,7 +210,7 @@ def build_the_model_mip_refine(m, lower_bounds, upper_bounds,
                     out_lb = lower_bounds[layer.inputs[0].name][0, neuron_idx]
                     out_ub = upper_bounds[layer.inputs[0].name][0, neuron_idx]
                     # Since the neurons that has positive coefficients in alpha-crown won't affect the
-                    # final lower bounds. So we don't have to refine them. But they may affect the bounds 
+                    # final lower bounds. So we don't have to refine them. But they may affect the bounds
                     # of other intermediate layer bounds. Start on the third linear layer.
                     if remove_neurons_from_A and unstable_neuron_filter.numel() != 0 and unstable_neuron_filter[neuron_idx] == 0:
                         if out_lb * out_ub < 0:
@@ -428,7 +440,9 @@ def build_the_model_mip_refine(m, lower_bounds, upper_bounds,
         upper_bounds[m.final_name] = upper_bounds[m.final_name].t()
         return lower_bounds, upper_bounds, ([history], [retb])
 
-    lb_refined, ub_refined, _ = m.get_interm_bounds(lb_refined)  # primals are better upper bounds
+    lb_refined, ub_refined = WorkingIntermBoundsInfo.from_net(m, move=False).to_complete_init_bounds(
+        m, lb_refined, None
+    )  # primals are better upper bounds
     ##### save refined betas to bab if not verified #####
     for mi, relu_layer in enumerate(m.net.relus):
         max_splits_per_layer = len(unstable_to_stable[mi])

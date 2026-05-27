@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -124,8 +124,8 @@ def input_split_on_relu_domains(domains, wrapped_net, batch_size):
 
     # Extract intermediate layer bounds from the network, and update.
     time_transfer = time.time()
-    new_interm_lbs, new_interm_ubs = wrapped_net.get_candidate_parallel(
-            new_final_layer_lb, new_final_layer_ub, device='cpu')
+    new_interm_lbs = {wrapped_net.final_name: new_final_layer_lb.detach()}
+    new_interm_ubs = {wrapped_net.final_name: new_final_layer_ub.detach()}
 
     # After input split, we have updated dom_lb and dom_ub.
     # Simply duplicate the domain parameters that are not updated.

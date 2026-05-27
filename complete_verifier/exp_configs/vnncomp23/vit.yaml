@@ -6,6 +6,8 @@ general:
   sparse_interm: false
   conv_mode: matrix
   adhoc_tuning: Customized("custom_adhoc_tuning", "customized_vit_tuning")
+model:
+  bound_opts: "{'softmax': 'complex'}"
 attack:
   pgd_order: skip
 solver:

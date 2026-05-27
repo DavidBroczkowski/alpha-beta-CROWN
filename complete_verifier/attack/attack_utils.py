@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -22,6 +22,7 @@ import torch
 from torch.optim import Optimizer
 from dataclasses import dataclass
 from typing import Optional
+from string import Template
 
 import arguments
 from load_model import inference_onnx, Customized
@@ -126,7 +127,7 @@ def check_and_save_cex(adv_input, adv_output, vnnlib, res_path, expected_verifie
     """
     adv_input: [batch_size, *input_shape]
     adv_output: [batch_size, num_output]
-    expected_verified_status: <"unsafe-pgd", "unsafe-bab", "unsafe", ...> 
+    expected_verified_status: <"unsafe-pgd", "unsafe-bab", "unsafe", ...>
     """
     print('\nChecking and Saving Counterexample in check_and_save_cex')
     assert adv_input.shape[0] == 1, f'The batch_size of adv_input should be 1.'
@@ -137,12 +138,15 @@ def check_and_save_cex(adv_input, adv_output, vnnlib, res_path, expected_verifie
     verified_status = expected_verified_status
     verified_success = True
 
+    if arguments.Globals['example_idx'] >= 0:
+        res_path = Template(res_path).substitute(IDX=arguments.Globals['example_idx'])
+
     if arguments.Config['general']['save_adv_example']:
-        if eval(arguments.Config['attack']['adv_verifier'])(adv_input, adv_output, vnnlib, 
+        if eval(arguments.Config['attack']['adv_verifier'])(adv_input, adv_output, vnnlib,
                                                             arguments.Config['general']['verify_onnxruntime_output']):
             try:
                 print('Saving counterexample to', os.path.abspath(res_path))
-                eval(arguments.Config['attack']['adv_saver'])(adv_input, adv_output, res_path) 
+                eval(arguments.Config['attack']['adv_saver'])(adv_input, adv_output, res_path)
                 verified_status = expected_verified_status
                 verified_success = True
             except Exception as e:
@@ -153,7 +157,7 @@ def check_and_save_cex(adv_input, adv_output, vnnlib, res_path, expected_verifie
         else:
             verified_status = 'unknown'
             verified_success = False
-                
+
     if arguments.Config['general']['eval_adv_example']:
         onnx_path = arguments.Config['model']['onnx_path']
         vnnlib_path = arguments.Config['specification']['vnnlib_path']
@@ -167,7 +171,7 @@ def check_and_save_cex(adv_input, adv_output, vnnlib, res_path, expected_verifie
             subprocess.run([sys.executable, script_path, onnx_path, vnnlib_path, res_path], check=True)
         except subprocess.CalledProcessError:
             print('Unexpected error in checking adv example')
-            
+
     if arguments.Config['general']['show_adv_example']:
         print('Adv example:')
         print(adv_input[0])
@@ -384,7 +388,7 @@ def boundary_attack(model, x, data_min, data_max):
 
 def default_adv_saver(adv_input, adv_output, res_path):
     '''
-    Saves an adversarial example and its corresponding outputs to a specified file in a 
+    Saves an adversarial example and its corresponding outputs to a specified file in a
     format compatible with further analysis or validation processes.
 
     Parameters:
@@ -402,16 +406,19 @@ def default_adv_saver(adv_input, adv_output, res_path):
         adv_output = inference_onnx(onnx_path, adv_input).flatten()
     adv_input = adv_input.flatten()
 
-    with open(res_path, 'w+') as f:
-        f.write("(")
-        for i in range(num_input):
-            f.write("(X_{}  {})\n".format(i, adv_input[i]))
-        f.write("(Y_{}  {})".format(0, adv_output[0]))
-        for j in range(1, num_output):
-            f.write("\n(Y_{}  {})".format(j, adv_output[j]))
-        f.write(")")
-        f.flush()
-    
+    if res_path.endswith(".pt"):
+        torch.save((adv_input, adv_output), res_path)
+    else:
+        with open(res_path, 'w+') as f:
+            f.write("(")
+            for i in range(num_input):
+                f.write("(X_{}  {})\n".format(i, adv_input[i]))
+            f.write("(Y_{}  {})".format(0, adv_output[0]))
+            for j in range(1, num_output):
+                f.write("\n(Y_{}  {})".format(j, adv_output[j]))
+            f.write(")")
+            f.flush()
+
     if arguments.Config["general"]["eval_adv_example"]:
         onnx_path = arguments.Config["model"]["onnx_path"]
         vnnlib_path = arguments.Config["specification"]["vnnlib_path"]
@@ -428,13 +435,13 @@ def default_adv_saver(adv_input, adv_output, res_path):
 
 
 def default_adv_verifier(adv_input, adv_output, vnnlib=None, check_output=False):
-    """ 
+    """
     Do two kinds of check on counterexample:
-    
-    1.check if the inference outptus are the same on both PyTorch and ONNXRuntime 
+
+    1.check if the inference outptus are the same on both PyTorch and ONNXRuntime
       (enabled when check_output is True)
     2.check if the output satisfied spec conditions (enabled when inputting vnnlib)
-    
+
     Args:
         adv_output: [1, *intput_shape]
         adv_input: [1, *input_shape]
@@ -445,8 +452,8 @@ def default_adv_verifier(adv_input, adv_output, vnnlib=None, check_output=False)
     rel_tol = 1e-3
     abs_tol = 1e-4
     if check_output and not is_onnx_equal_to_pytorch_output(arguments.Config['model']['onnx_path'],
-                                                            onnx_adv_input, 
-                                                            flatten_output.detach().cpu().numpy(), rel_tol): 
+                                                            onnx_adv_input,
+                                                            flatten_output.detach().cpu().numpy(), rel_tol):
         return False
 
     if vnnlib is not None and not is_specification_vio(vnnlib, adv_input.view(-1), flatten_output, abs_tol):
@@ -458,20 +465,20 @@ def default_adv_verifier(adv_input, adv_output, vnnlib=None, check_output=False)
 def is_onnx_equal_to_pytorch_output(onnx_path, onnx_adv_input, pytorch_y, rel_tol):
     """
     Compare the output of ONNX Runtime and PyTorch for given inputs.
-    
+
     Args:
         onnx_path (str): Path to the ONNX model.
         onnx_adv_input (numpy.ndarray): Input for ONNX model.
         pytorch_y (numpy.ndarray): Expected output from PyTorch model.
         rel_tol (float): Relative tolerance for comparison.
-    
+
     Returns:
         bool: True if the outputs are similar within the given tolerance, False otherwise.
     """
     print('Checking if onnxruntime output is equal to pytorch')
     onnx_output = inference_onnx(onnx_path, onnx_adv_input)
     onnxruntime_y = onnx_output.flatten("C")
-    
+
     try:
         diff = np.linalg.norm(onnxruntime_y - pytorch_y, ord=np.inf)
         norm = np.linalg.norm(pytorch_y, ord=np.inf)
@@ -494,25 +501,25 @@ def is_onnx_equal_to_pytorch_output(onnx_path, onnx_adv_input, pytorch_y, rel_to
 def is_specification_vio(box_spec_list, x_list, expected_y, tol):
     """Check that the spec file was obeyed"""
     rv = False
-    
+
     for i, box_spec in enumerate(box_spec_list):
         input_box, spec_list = box_spec
         assert len(input_box) == len(x_list), f"input box len: {len(input_box)}, x_in len: {len(x_list)}"
 
         input_box_tensor = torch.tensor(input_box, dtype=x_list.dtype, device=x_list.device)
         lb_tensor, ub_tensor = input_box_tensor[:, 0], input_box_tensor[:, 1]
-        
+
         # Check if x_list is inside the input box using tensor operations
         inside_input_box = torch.all((x_list >= lb_tensor - tol) & (x_list <= ub_tensor + tol))
 
         if inside_input_box:
             # Check spec
             violated = False
-                
+
             for j, (prop_mat, prop_rhs) in enumerate(spec_list):
                 prop_mat_tensor = torch.tensor(prop_mat, dtype=expected_y.dtype, device=expected_y.device)
                 prop_rhs_tensor = torch.tensor(prop_rhs, dtype=expected_y.dtype, device=expected_y.device)
-                
+
                 vec = torch.matmul(prop_mat_tensor, expected_y)
                 sat = torch.all(vec <= prop_rhs_tensor + tol)
 
@@ -523,7 +530,7 @@ def is_specification_vio(box_spec_list, x_list, expected_y, tol):
             if violated:
                 rv = True
                 break
-    
+
     if rv:
         print('Succeed in specification conditions check.')
     else:

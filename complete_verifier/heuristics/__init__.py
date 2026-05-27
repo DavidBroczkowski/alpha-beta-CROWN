@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -12,7 +12,10 @@
 ##        contained in the LICENCE file in this directory.             ##
 ##                                                                     ##
 #########################################################################
-from heuristics.branching_heuristics import get_branching_heuristic
+from heuristics.branching_heuristics import (
+    get_branching_heuristic,
+    BranchingHeuristicObj,
+)
 from heuristics.base import RandomNeuronBranching, InterceptBranching
 from heuristics.babsr import BabsrBranching
 from heuristics.fsb import FsbBranching

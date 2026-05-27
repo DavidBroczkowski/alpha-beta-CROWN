@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -19,15 +19,19 @@ from collections import defaultdict
 import operator
 from types import SimpleNamespace
 import arguments
-from itertools import islice, chain
+from itertools import chain
 from collections import deque
 import math
 
 from tensor_storage import get_tensor_storage
-from domain_clipper import update_interm_bounds
+from domain_clipper import (
+    update_interm_bounds,
+    SubDomainClipDecisions,
+    SubDomainClipDecisionsDB,
+)
 from utils import fast_hist_copy, check_infeasible_bounds, convert_history_from_list
-
-
+from heuristics.decision_types import BatchFirstBranchingDecisions
+from state import WorkingIntermBoundsInfo
 class AbstractDomainList():
     """Abstract class that maintains the list of domains (variables on CPUs)."""
 
@@ -78,10 +82,22 @@ class AbstractDomainList():
 class BatchedDomainList(AbstractDomainList):
     """An unsorted but batched list of domain list."""
 
-    def __init__(self, ret, c, lAs, global_lbs, global_ubs,
-                 alphas=None, history=None, thresholds=None,
-                 net=None, branching_input_and_activation=False, x=None,
-                 enable_clip_domains=False):
+    def __init__(
+        self,
+        ret,
+        c,
+        lAs,
+        global_lbs,
+        global_ubs,
+        alphas=None,
+        history=None,
+        thresholds=None,
+        net=None,
+        branching_input_and_activation=False,
+        x=None,
+        enable_clip_domains=False,
+        timer=None,
+    ):
         super().__init__()
 
         lb_alls, ub_alls = ret['lower_bounds'], ret['upper_bounds']
@@ -90,8 +106,14 @@ class BatchedDomainList(AbstractDomainList):
         assert len(lb_alls) == len(ub_alls)
 
         self.net = net
+        self.timer = timer
 
         self.all_lAs = {k: get_tensor_storage(v.cpu()) for k, v in lAs.items()}
+        self.all_lAs_dropped = False
+
+        self.all_clip_decisions = SubDomainClipDecisionsDB()
+        # to be init later otherwise in a disabled state
+
         self.all_global_lbs = get_tensor_storage(global_lbs.cpu())
         self.all_global_ubs = get_tensor_storage(global_ubs.cpu())
         self.all_lb_alls = {k: get_tensor_storage(v.cpu()) for k, v in lb_alls.items()}
@@ -113,33 +135,43 @@ class BatchedDomainList(AbstractDomainList):
             self.all_thresholds = get_tensor_storage(torch.cat([thresholds] * num).cpu())
         self.Cs = get_tensor_storage(c.cpu())
 
-        # === seperator, things above are big tensors, things below are lists ===
+        # === separator, things above are big tensors, things below are lists ===
         self.all_betas = [beta for _ in range(num)]
-        self.all_intermediate_betas = [None for _ in range(num)]
         self.histories = [fast_hist_copy(history) for _ in range(num)]
         self.split_histories = [[] for _ in range(num)]
         self.depths = [0] * num
+
+        # ======== decision info ========
+        # (batch, objects)
+
+        self.all_decision_split_depths = [torch.nan] * num
+        self.all_decision_branching_decisions = [
+            ValueError("precompute decision not available at first iteration")
+        ] * num
+        self.all_decision_branching_points = [
+            ValueError("precompute decision not available at first iteration")
+        ] * num
+
         if arguments.Config['bab']['tree_traversal'] == 'breadth_first':
             self.all_betas = deque(self.all_betas)
-            self.all_intermediate_betas = deque(self.all_intermediate_betas)
             self.histories = deque(self.histories)
             self.split_histories = deque(self.split_histories)
             self.depths = deque(self.depths)
 
+            self.all_decision_split_depths = deque(self.all_decision_split_depths)
+            self.all_decision_branching_decisions = deque(
+                self.all_decision_branching_decisions
+            )
+            self.all_decision_branching_points = deque(
+                self.all_decision_branching_points
+            )
+
         # tracker of number of domains
         self.num_domains = len(self.histories)
 
-        # === save things for statical intermediate bound ===
+        # === save things for static intermediate bound ===
         self.interm_transfer = arguments.Config['bab']['interm_transfer']
         self.final_name = net.final_name
-        self.static_lb = {k: (lb[0:1].to(device=net.device, non_blocking=True)
-                              if torch.cuda.is_available() else lb[0:1])
-                              for k, lb in self.all_lb_alls.items()
-                              if k != self.final_name}
-        self.static_ub = {k: (ub[0:1].to(device=net.device, non_blocking=True)
-                              if torch.cuda.is_available() else ub[0:1])
-                              for k, ub in self.all_ub_alls.items()
-                              if k != self.final_name}
         self.unstable_mask = {}
         self.unstable_interm_bounds = None
 
@@ -155,6 +187,11 @@ class BatchedDomainList(AbstractDomainList):
             self.all_x_Us = get_tensor_storage(x.ptb.x_U.cpu())
         else:
             self.all_input_split_idx = self.all_x_Ls = self.all_x_Us = None
+
+    def drop_lAs(self):
+        """Drop field lAs"""
+        self.all_lAs = {}
+        self.all_lAs_dropped = True
 
     def update_unstable_mask(self, updated_mask):
         """
@@ -217,15 +254,16 @@ class BatchedDomainList(AbstractDomainList):
                 self.all_global_lbs,
                 self.all_global_ubs,
                 self.Cs,
-                self.all_thresholds
+                self.all_thresholds,
             ],
-            self.all_lAs.values()
+            self.all_lAs.values(),
+            self.all_clip_decisions.values(),
         ):
             if item is not None:
                 item.reorder(N, indices)
 
-        # If intermediate transfer is used, also reorder the lower and bounds.
-        # If not, the static bounds are stored in the class, not need to be reordered.
+        # If intermediate transfer is used, also reorder the lower and upper bounds.
+        # If not, the static bounds are stored in the class, no need to be reordered.
         # This part costs time and memory.
         if self.interm_transfer and self.unstable_interm_bounds is not None:
             for key, bounds in self.unstable_interm_bounds.items():
@@ -254,7 +292,15 @@ class BatchedDomainList(AbstractDomainList):
             selector = lambda arr: (arr[indices_lst[0]],)
 
         # List of attribute names to reorder.
-        for name in ('histories', 'depths', 'split_histories', 'all_betas', 'all_intermediate_betas'):
+        for name in (
+            "histories",
+            "depths",
+            "split_histories",
+            "all_betas",
+            "all_decision_split_depths",
+            "all_decision_branching_decisions",
+            "all_decision_branching_points",
+        ):
             item = getattr(self, name)
             if item is not None:
                 # Apply the selector to reorder the list and update the attribute.
@@ -278,6 +324,9 @@ class BatchedDomainList(AbstractDomainList):
         batch = min(len(self), int(batch))
 
         new_lAs = {k: _to(lA.pop(batch)) for k, lA in self.all_lAs.items()}
+        sub_domain_clip_decisions = (
+            self.all_clip_decisions.pop_obj_idx(batch)
+        )
         new_x_Ls = _to(self.all_x_Ls.pop(batch)) if self.all_x_Ls is not None else None
         new_x_Us = _to(self.all_x_Us.pop(batch)) if self.all_x_Us is not None else None
         new_input_split_idx = (_to(self.all_input_split_idx.pop(batch))
@@ -292,67 +341,112 @@ class BatchedDomainList(AbstractDomainList):
         cs = _to(self.Cs.pop(batch))
         thresholds = _to(self.all_thresholds.pop(batch))
 
-        lower_bounds, upper_bounds = self._interm_bounds_wo_transfer(batch, device)
+        final_lb = {self.final_name: _to(self.all_lb_alls[self.final_name].pop(batch))}
+        final_ub = {self.final_name: _to(self.all_ub_alls[self.final_name].pop(batch))}
 
         if self.interm_transfer and self.unstable_interm_bounds is not None:
-            interm_bounds = {k: [lower_bounds[k], upper_bounds[k]] for k in lower_bounds if k != self.final_name}
-            unstable_bounds = {k: [_to(self.unstable_interm_bounds[k][0].pop(batch)),
-                                    _to(self.unstable_interm_bounds[k][1].pop(batch))]
-                                    for k in self.unstable_interm_bounds}
-            interm_bounds = update_interm_bounds(interm_bounds, unstable_bounds, self.final_name, self.unstable_mask)
-            for k, v in interm_bounds.items():
-                lower_bounds[k] = v[0]
-                upper_bounds[k] = v[1]
-
-        # TODO Move to beta_CROWN_solver. Duplicate code.
-        new_masks = {}
-        for k in lower_bounds:
-            if k not in self.net.split_activations:
-                continue
-            mask = None
-            for activation, index in self.net.split_activations[k]:
-                mask_ = _to(
-                    activation.get_split_mask(
-                        lower_bounds[k], upper_bounds[k], index
-                    ).flatten(1))
-                mask = mask_ if mask is None else torch.logical_or(mask, mask_)
-            if mask is None:
-                mask = torch.ones_like(lower_bounds[k], dtype=torch.bool).flatten(1)
-            new_masks[k] = mask
+            unstable_bounds = {
+                k: [
+                    _to(self.unstable_interm_bounds[k][0].pop(batch)),
+                    _to(self.unstable_interm_bounds[k][1].pop(batch)),
+                ]
+                for k in self.unstable_interm_bounds
+            }
+        else:
+            unstable_bounds = ValueError("No unstable bounds")
 
         # Handle lists.
         if arguments.Config['bab']['tree_traversal'] == 'breadth_first':
             betas_all = [self.all_betas.popleft() for _ in range(batch)]
-            intermediate_betas_all = [self.all_intermediate_betas.popleft() for _ in range(batch)]
             history = [self.histories.popleft() for _ in range(batch)]
             split_history = [self.split_histories.popleft() for _ in range(batch)]
             depths = [self.depths.popleft() for _ in range(batch)]
+
+            decision_split_depth = [
+                self.all_decision_split_depths.popleft() for _ in range(batch)
+            ]
+            decision_branching_decisions = [
+                self.all_decision_branching_decisions.popleft() for _ in range(batch)
+            ]
+            decision_branching_points = [
+                self.all_decision_branching_points.popleft() for _ in range(batch)
+            ]
+            batch_first_branching_decisions = BatchFirstBranchingDecisions(
+                packed_branching_decision=decision_branching_decisions,
+                packed_branching_points=decision_branching_points,
+                packed_branching_points_split_depth=torch.Tensor(decision_split_depth),
+                batch_size=batch,
+            )
+
             self.num_domains -= batch
+
         else:
             betas_all = self.all_betas[self.num_domains - batch: self.num_domains]
-            intermediate_betas_all = self.all_intermediate_betas[self.num_domains - batch: self.num_domains]
             history = self.histories[self.num_domains - batch: self.num_domains]
             split_history = self.split_histories[self.num_domains - batch: self.num_domains]
             depths = self.depths[self.num_domains - batch: self.num_domains]
 
+            decision_split_depth = self.all_decision_split_depths[
+                self.num_domains - batch : self.num_domains
+            ]
+            decision_branching_decisions = self.all_decision_branching_decisions[
+                self.num_domains - batch : self.num_domains
+            ]
+            decision_branching_points = self.all_decision_branching_points[
+                self.num_domains - batch : self.num_domains
+            ]
+            batch_first_branching_decisions = BatchFirstBranchingDecisions(
+                packed_branching_decision=decision_branching_decisions,
+                packed_branching_points=decision_branching_points,
+                packed_branching_points_split_depth=(
+                    torch.Tensor(decision_split_depth)
+                    if not isinstance(decision_split_depth[0], Exception)
+                    else decision_split_depth[0]
+                ),
+                batch_size=batch,
+            )
+
             self.num_domains -= batch
 
             self.all_betas = self.all_betas[:self.num_domains]
-            self.all_intermediate_betas = self.all_intermediate_betas[:self.num_domains]
             self.histories = self.histories[:self.num_domains]
             self.split_histories = self.split_histories[:self.num_domains]
             self.depths = self.depths[:self.num_domains]
 
+            self.all_decision_split_depths = self.all_decision_split_depths[
+                : self.num_domains
+            ]
+            self.all_decision_branching_decisions = (
+                self.all_decision_branching_decisions[: self.num_domains]
+            )
+            self.all_decision_branching_points = self.all_decision_branching_points[
+                : self.num_domains
+            ]
 
         return {
-            'mask': new_masks, 'lAs': new_lAs,
-            'lower_bounds': lower_bounds, 'upper_bounds': upper_bounds,
-            'alphas': alphas, 'betas': betas_all,
-            'intermediate_betas': intermediate_betas_all,
-            'history': history, 'split_history': split_history,
-            'global_lb': global_lb, 'depths': depths, 'cs': cs,
-            'thresholds': thresholds, 'x_Ls': new_x_Ls, 'x_Us': new_x_Us,
-            'input_split_idx': new_input_split_idx,
+            "lAs": new_lAs,
+            "lower_bounds": ValueError(
+                "You should use IntermBoundsFactory to construct one"
+            ),
+            "upper_bounds": ValueError(
+                "You should use IntermBoundsFactory to construct one"
+            ),
+            "unstable_bounds": unstable_bounds,
+            "final_lb": final_lb,
+            "final_ub": final_ub,
+            "alphas": alphas,
+            "betas": betas_all,
+            "history": history,
+            "split_history": split_history,
+            "global_lb": global_lb,
+            "depths": depths,
+            "cs": cs,
+            "thresholds": thresholds,
+            "x_Ls": new_x_Ls,
+            "x_Us": new_x_Us,
+            "input_split_idx": new_input_split_idx,
+            "batch_first_branching_decisions": batch_first_branching_decisions,
+            "sub_domain_clip_decisions": sub_domain_clip_decisions,
         }
 
     def add(self, bounds, d, check_infeasibility):
@@ -392,9 +486,38 @@ class BatchedDomainList(AbstractDomainList):
                 else lambda _arr: (_arr[batch_indexer_lst[0]], ))
             self.histories.extend(selector(histories))
             self.all_betas.extend(selector(bounds['betas']))
-            self.all_intermediate_betas.extend(selector(bounds['intermediate_betas']))
             self.split_histories.extend(selector(bounds['split_history']))
             self.depths.extend(selector(d['depths']))
+
+            # handle narrowing
+            sub_domain_clip_decisions = bounds["sub_domain_clip_decisions"].index_select(indexer)
+            target_split_depth = self.all_clip_decisions.determine_narrow(
+                sub_domain_clip_decisions
+            )
+            # if target_split_depth == 0, then no narrowing is needed.
+            if target_split_depth > 0:
+                domain_decision: BatchFirstBranchingDecisions = bounds["decision_info"]
+                domain_decision = domain_decision.narrow_to(target_split_depth)
+                self.all_clip_decisions.add_clip_decisions(
+                    sub_domain_clip_decisions.narrow_to(target_split_depth)
+                )
+            else:
+                domain_decision: BatchFirstBranchingDecisions = bounds["decision_info"]
+                self.all_clip_decisions.add_clip_decisions(
+                    sub_domain_clip_decisions
+                )
+
+            # domain and decisions
+            self.all_decision_split_depths.extend(
+                selector(domain_decision.packed_branching_points_split_depth),
+            )
+            self.all_decision_branching_decisions.extend(
+                selector(domain_decision.packed_branching_decision)
+            )
+            self.all_decision_branching_points.extend(
+                selector(domain_decision.packed_branching_points)
+            )
+
         for k in self.all_lAs:
             self.all_lAs[k].append(bounds['lAs'][k][indexer])
         if self.all_x_Ls is not None:
@@ -435,82 +558,6 @@ class BatchedDomainList(AbstractDomainList):
         self.all_thresholds.append(decision_threshs[indexer])
         self.Cs.append(bounds['c'][indexer])
         self.num_domains = len(self.histories)
-
-    def _interm_bounds_wo_transfer(self, batch, device):
-        def _to(x, non_blocking=True):
-            return x.to(device=device, non_blocking=non_blocking)
-
-        # Initialize bounds dictionaries
-        lower_bounds, upper_bounds = {}, {}
-        lower_bounds[self.final_name] = _to(
-            self.all_lb_alls[self.final_name].pop(batch))
-        upper_bounds[self.final_name] = _to(
-            self.all_ub_alls[self.final_name].pop(batch))
-
-        # FIXME This part of code looks unreliable. Need to be clear when
-        # this situation might happen.
-        # Handle static bounds resizing
-        for k in self.static_lb:
-            # enlarge the batch size in the static storage
-            if batch > self.static_lb[k].shape[0]:
-                power = (batch + self.static_lb[k].shape[0] - 1) // self.static_lb[k].shape[0]
-                self.static_lb[k] = self.static_lb[k].repeat(
-                    power, *([1] * (self.static_lb[k].dim() - 1)))
-            if batch > self.static_ub[k].shape[0]:
-                power = (batch + self.static_ub[k].shape[0] - 1) // self.static_ub[k].shape[0]
-                self.static_ub[k] = self.static_ub[k].repeat(
-                    power, *([1] * (self.static_ub[k].dim() - 1)))
-
-        # need to fill in the slots
-        if arguments.Config['bab']['tree_traversal'] == 'breadth_first':
-            # Get items from the deque without removing them.
-            histories = list(islice(self.histories, 0, batch))
-        else:
-            histories = self.histories[self.num_domains - batch: self.num_domains]
-
-        for i in self.static_lb:
-            lower_bounds[i] = self.static_lb[i][:batch].clone()
-            upper_bounds[i] = self.static_ub[i][:batch].clone()
-
-            # Lists to collect data for vectorized update
-            lb_batch_indices, lb_neuron_indices, lb_values = [], [], []
-            ub_batch_indices, ub_neuron_indices, ub_values = [], [], []
-
-            for j, hist in enumerate(histories):
-                if i in hist:
-                    hist[i] = convert_history_from_list(hist[i])
-                    indices, directions, values = hist[i][0], hist[i][1], hist[i][2]
-                    assert indices.shape[0] == directions.shape[0] == values.shape[0], \
-                        f"Indices, directions, and values must have the same length. " \
-                        f"Got {indices.shape[0]}, {directions.shape[0]}, {values.shape[0]}."
-
-                    # Create masks for lower and upper bounds
-                    lb_mask = directions > 0
-                    ub_mask = ~lb_mask
-
-                    # Append data for lower bound updates
-                    lb_batch_indices.extend([j] * lb_mask.sum())
-                    lb_neuron_indices.append(indices[lb_mask])
-                    lb_values.append(values[lb_mask])
-
-                    # Append data for upper bound updates
-                    ub_batch_indices.extend([j] * ub_mask.sum())
-                    ub_neuron_indices.append(indices[ub_mask])
-                    ub_values.append(values[ub_mask])
-
-            # Perform vectorized update for lower bounds
-            if lb_batch_indices:
-                neuron_indices = torch.cat(lb_neuron_indices)
-                vals = torch.cat(lb_values)
-                lower_bounds[i].view(batch, -1)[lb_batch_indices, neuron_indices] = _to(vals)
-
-            # Perform vectorized update for upper bounds
-            if ub_batch_indices:
-                neuron_indices = torch.cat(ub_neuron_indices)
-                vals = torch.cat(ub_values)
-                upper_bounds[i].view(batch, -1)[ub_batch_indices, neuron_indices] = _to(vals)
-
-        return lower_bounds, upper_bounds
 
     def _assemble_domains(self, global_lbs, global_ubs, history, split_history, depth, thresholds):
         ans = []
@@ -556,10 +603,10 @@ class ShallowFirstBatchedDomainList(BatchedDomainList):
 
     def __init__(self, ret, c, lAs, global_lbs, global_ubs,
                  alphas=None, history=None, thresholds=None,
-                 net=None, branching_input_and_activation=False, x=None):
+                 net=None, branching_input_and_activation=False, x=None, timer=None):
         super().__init__(ret, c, lAs, global_lbs, global_ubs,
                          alphas, history, thresholds,
-                         net, branching_input_and_activation, x)
+                         net, branching_input_and_activation, x, timer=timer)
         self.is_initial_setup = True
         self.use_bfs = True
         # For multi-tree search, we don't just track a single binary tree that defines all explored domains.
@@ -731,7 +778,6 @@ class ShallowFirstBatchedDomainList(BatchedDomainList):
             best_tree.pos_child = self._generate_tree(current["children"][root_node][1.0])
         return best_tree
 
-
     def _get_best_next_node(self, current):
         nodes = current["children"].keys()
         best_node = None
@@ -884,7 +930,7 @@ class ShallowFirstBatchedDomainList(BatchedDomainList):
 
         if not torch.any(indexer):
             return
-        
+
         if len(indexer) > 1:
             self.mtb_backup.append({
                 'bounds': copy.deepcopy(bounds),
@@ -933,7 +979,12 @@ class ShallowFirstBatchedDomainList(BatchedDomainList):
             )
 
         # dicts
-        for key in ['lower_bounds', 'upper_bounds', 'lAs']:
+        for key in [
+            "lower_bounds",
+            "upper_bounds",
+            "lAs",
+            "sub_domain_clip_decisions",
+        ]:
             for layer_name, val in bounds[key].items():
                 bounds[key][layer_name] = bounds[key][layer_name][best_k_lower_bounds]
         for key in ['lower_bounds']:
@@ -952,10 +1003,22 @@ class ShallowFirstBatchedDomainList(BatchedDomainList):
             operator.itemgetter(*batch_indexer_lst)
             if len(batch_indexer_lst) > 1
             else lambda _arr: (_arr[batch_indexer_lst[0]], ))
-        for key in ['betas', 'split_history', 'intermediate_betas']:
+        for key in ['betas', 'split_history']:
             bounds[key] = selector(bounds[key])
         d['history'] = selector(d['history'])
         d['depths'] = selector(d['depths'])
+
+        # TODO. clean me.
+        decision_info: BatchFirstBranchingDecisions = bounds["decision_info"]
+        decision_info.packed_branching_points_split_depth = (
+            decision_info.packed_branching_points_split_depth[batch_indexer_lst]
+        )
+        decision_info.packed_branching_decision = list(
+            selector(decision_info.packed_branching_decision)
+        )
+        decision_info.packed_branching_points = list(
+            selector(decision_info.packed_branching_points)
+        )
 
         # Tensors
         for key in ['c', 'x_Ls', 'x_Us', 'input_split_idx']:

@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -16,13 +16,14 @@ from collections import defaultdict
 import torch
 import numpy as np
 from heuristics.babsr import BabsrBranching, babsr_score
+from heuristics.decision_types import BranchingDecisions
 from utils import get_reduce_op
 
 
 class FsbBranching(BabsrBranching):
 
     @torch.no_grad()
-    def get_branching_decisions(
+    def compute_branching_decisions(
             self, domains, split_depth, branching_candidates=5,
             branching_reduceop='min', use_beta=False, prioritize_alphas='none',
             **kwargs):
@@ -209,4 +210,9 @@ class FsbBranching(BabsrBranching):
                           range(split_depth)]  # change the order of final decision to split_depth * batch
         final_decision = sum(final_decision, [])
 
-        return final_decision, None, split_depth # None for points
+        return BranchingDecisions(
+            branching_decision=final_decision,
+            branching_points=None,
+            split_depth=split_depth,
+            batch_size=batch,
+        )

@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -29,6 +29,7 @@ from utils import check_infeasible_bounds, Stats
 from auto_LiRPA.perturbations import PerturbationLpNorm
 from auto_LiRPA import BoundedTensor
 from cuts.cut_utils import clean_net_mps_process
+from state import WorkingIntermBoundsInfo
 
 
 diving_Visited = 0  # FIXME (10/21): Do not use global variable here.
@@ -266,7 +267,8 @@ def beam_alpha_crown(net, splits, coeffs):
                                 interm_bounds=interm_bounds,
                                 reference_bounds=reference_bounds,
                                 bound_upper=False, needed_A_dict=net.needed_A_dict)
-    lower_bounds_new, upper_bounds_new = net.get_candidate_parallel(lb, lb + 99)
+    working_interm_bounds = WorkingIntermBoundsInfo.from_net(net, move=False)
+    lower_bounds_new, upper_bounds_new = working_interm_bounds.to_complete_init_bounds(net, lb, lb + 99)
 
     return lower_bounds_new, upper_bounds_new
 
@@ -468,14 +470,14 @@ def bab_attack(dive_domains, net, batch, fix_interm_bounds=True, adv_pool=None):
         'alphas': alphas, 'betas': betas, 'history': history
     }
 
-    dive_decisions, _, _ = (
-        KfsbBranching(net).get_branching_decisions(domains, split_depth,
-                                                   branching_candidates=split_depth,
-                                                   branching_reduceop=branching_reduceop,
-                                                   method=branching_method,
-                                                   prioritize_alphas="none",
-                                                   # Change to "negative" to branch on upper bound first.
-                                                   ))
+    dive_decisions = KfsbBranching(net).compute_branching_decisions(
+        domains, split_depth,
+        branching_candidates=split_depth,
+        branching_reduceop=branching_reduceop,
+        method=branching_method,
+        prioritize_alphas="none",
+        # Change to "negative" to branch on upper bound first.
+    ).branching_decision
     # In beam search, we use the same branching decisions for all nodes, so we merge branching decisions for different nodes into 1.
     merged_decisions = merge_split_decisions(dive_decisions, len(dive_decisions[0]))
     print('splitting decisions: {}'.format(merged_decisions[0]))
@@ -687,7 +689,7 @@ def add_dive_domain_from_dive_decisions(dive_domains, dive_decisions, mask=None,
     merged_upper_bounds = []
     betas_all = []
     alphas_all = []
-    ret_s = defaultdict.fromkeys(dive_domains[0].alpha.keys(), None)
+    ret_alphas = defaultdict.fromkeys(dive_domains[0].alpha.keys(), None)
     # intermediate_betas_all = []
 
     for di, dive_d in enumerate(dive_domains):
@@ -793,7 +795,7 @@ def add_dive_domain_from_dive_decisions(dive_domains, dive_decisions, mask=None,
 
     for m_name in list(alphas_all[0].keys()):
         for spec_name in alphas_all[0][m_name]:
-            ret_s[m_name] = {spec_name: torch.cat([alphas_all[i][m_name][spec_name] for i in range(len(alphas_all))], dim=2)}
+            ret_alphas[m_name] = {spec_name: torch.cat([alphas_all[i][m_name][spec_name] for i in range(len(alphas_all))], dim=2)}
 
     # Recompute the mask on GPU.
     new_masks = []
@@ -802,7 +804,7 @@ def add_dive_domain_from_dive_decisions(dive_domains, dive_decisions, mask=None,
             torch.logical_and(ret_lbs[j] < 0, ret_ubs[j] > 0).view(ret_lbs[0].size(0), -1).float())
     print(f"expand original {len(dive_domains)} selected domains to {len(new_dive_domains)} with {num_splits} splits")
 
-    return new_masks, ret_lbs, ret_ubs, ret_s, betas_all, new_dive_domains
+    return new_masks, ret_lbs, ret_ubs, ret_alphas, betas_all, new_dive_domains
 
 
 def add_dive_domain_parallel(lA, lb, ub, lb_all, ub_all, dive_domains, selected_domains, alpha, beta,

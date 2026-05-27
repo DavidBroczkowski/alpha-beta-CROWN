@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -280,10 +280,13 @@ class ConfigHandler:
         self.add_argument("--batch_size", type=int, default=64,
                           help='Batch size in bound solver (number of parallel splits).',
                           hierarchy=h + ["batch_size"])
-        self.add_argument("--no_auto_enlarge_batch_size", action='store_false',
-                          help='Automatically increase batch size based on --batch_size in bab '
-                               'if current VRAM usage < 45%%, only support input_split.',
+        self.add_argument("--no_auto_enlarge_batch_size", dest='auto_enlarge_batch_size', action='store_false', default=True,
+                          help='Disable automatic increase of batch size based on --batch_size in bab '
+                               'when current VRAM usage < 45%%; only supports input_split.',
                           hierarchy=h + ["auto_enlarge_batch_size"])
+        self.add_argument("--auto_enlarge_batch_size", dest='auto_enlarge_batch_size', action='store_true',
+                          help='Override to enable auto enlarge batch size (for internal tests).',
+                          hierarchy=h + ["auto_enlarge_batch_size"], private=True)
         self.add_argument("--batched_crown_auto_enlarge_max_vram_ratio", type=float, default=0.9,
                           help='Automatically increase batch size based on --batch_size in bab '
                                'if current VRAM usage < (batched_crown_auto_enlarge_max_vram_ratio / 2)%%, only support batched crown.',
@@ -301,7 +304,7 @@ class ConfigHandler:
                           help='Start to save best optimized bounds when i > int(iteration*start_save_best). Early iterations are skipped for better efficiency.',
                           hierarchy=h + ["start_save_best"])
         self.add_argument('--bound_prop_method', default="alpha-crown",
-                          choices=["alpha-crown", "crown", "forward", "forward+crown",
+                          choices=["lp", "lp+crown", "alpha-crown", "crown", "forward", "forward+crown",
                                    "alpha-forward", "crown-ibp", "init-crown", "ibp",
                                    "dynamic-forward", "dynamic-forward+crown", "dynamic-forward+backward"],
                           help='Bound propagation method used for incomplete verification and input split based branch and bound.',
@@ -556,10 +559,6 @@ class ConfigHandler:
         self.add_argument("--sort_domain_interval", type=int, default=-1,
                           help='If unsorted domains are used, sort the domains every sort_domain_interval iterations.',
                           hierarchy=h + ["sort_domain_interval"])
-        self.add_argument("--vanilla_crown_bab", action="store_true",
-                          dest="vanilla_crown_bab",
-                          help='Use vanilla CROWN during BaB.',
-                          hierarchy=h + ['vanilla_crown'])
         self.add_argument("--tree_traversal", default="depth_first",
                           choices=["depth_first", "breadth_first"],
                           help='During BaB, unknown domains can continue being split (deepening the tree, i.e. depth first traversal) or split only when all other unknown domains have the same number of splits (keeping the tree shallow for as long as possible, i.e. breadth first traversal). Depth first traversal minimizes memory access time, breadth first traversal is beneficial for BICCOS.',
@@ -632,6 +631,12 @@ class ConfigHandler:
         self.add_argument("--manual_cuts", type=str, default=None,
                           help='Feed manual cuts using this argument. The cut file should be named xxx.cuts.',
                           hierarchy=h + ["manual_cuts"])
+        self.add_argument("--record_cplex_cut_to", type=str, default=None,
+                          help='Path to CSV file for recording CPLEX cuts for replay. If specified, all cuts fetched from CPLEX will be saved. The batch ID will be automatically appended to the filename (e.g., cut_records.csv becomes cut_records_batch_0.csv). Pickle files will be saved in a folder next to the CSV file.',
+                          hierarchy=h + ["record_cplex_cut_to"])
+        self.add_argument("--read_cplex_cut_from", type=str, default=None,
+                          help='Path to CSV file for reading CPLEX cuts for replay. If specified, cuts will be replayed from this CSV file instead of fetching from CPLEX. The batch ID will be automatically appended to the filename (e.g., cut_records.csv becomes cut_records_batch_0.csv).',
+                          hierarchy=h + ["read_cplex_cut_from"])
 
         h = ["bab", "cut", "biccos"]
         self.add_argument("--biccos_cuts", action='store_true',
@@ -763,6 +768,9 @@ class ConfigHandler:
         self.add_argument("--branching_relu_iterations", type=int, default=50,
                           help="Number of iterations to run relu split before we run input split.",
                           hierarchy=h + ["branching_relu_iterations"])
+        self.add_argument("--save_visited_domains_to", type=str, default="",
+                          help="Save visited domains to the specified path for visualization.",
+                          hierarchy=h + ["save_visited_domains_to"])
 
         h = ["bab", "branching", "nonlinear_split"]
         self.add_argument("--nonlinear_split_method", type=str, default='bbps',
@@ -830,6 +838,11 @@ class ConfigHandler:
         self.add_argument('--branching_point_step_size', type=float, default=0.2,
                           help='Step size for 2d and above nonlinearities.',
                           hierarchy=h + ['step_size'])
+
+        h = ["bab", "branching_decision_precompute"]
+        self.add_argument('--no_branching_decision_precompute', action='store_false',
+                          help='Try to enable branching decision precomputing.',
+                          hierarchy=h + ["enable"])
 
         h = ["bab", "branching", "input_split"]
         self.add_argument("--split_hint", type=float, nargs='+',
@@ -1084,6 +1097,14 @@ class ConfigHandler:
                           help="Keys to omit from the minimal config file.",
                           hierarchy=h + ['save_minimal_config_omit_keys'])
 
+        h = ["solving"]
+        self.add_argument("--solving_mode", action="store_true",
+                          help="Enable solving mode.",
+                          hierarchy=h + ["solving_mode"])
+        self.add_argument('--obj_index', type=int, default=0,
+                          help='The index of the objective in the output.',
+                          hierarchy=h+ ['obj_index'])
+
     def update_arguments(self):
         """Adaptively tune arguments."""
 
@@ -1285,6 +1306,7 @@ Config = ConfigHandler()
 Globals = ReadOnlyDict({
     "starting_timestamp": int(time.time()),
     "example_idx": -1,
+    "sanity_check_offset": None,
     "out": {"idx": None, "pred": None, "attack_margin": None, "pred_adv": None,
             "init_crown_bounds": None, "init_alpha_crown": None,
             "refined_lb": None, "decisions": [], "results": 'timeout',

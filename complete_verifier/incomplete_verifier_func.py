@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -42,6 +42,9 @@ def incomplete_verifier(
     ]
     # --------------------- invprop end ---------------------
 
+    # TODO: clean up the implementation of solving_mode
+    solving_mode = arguments.Config["solving"]["solving_mode"]
+
     spec_handler = SpecHandler(self.vnnlib_handler)
     x, c, rhs = spec_handler.x, spec_handler.c, spec_handler.rhs
     or_spec_size = spec_handler.or_spec_size
@@ -76,6 +79,7 @@ def incomplete_verifier(
     global_lb, ret = model.build(
         x, c, rhs, stop_criterion, vnnlib_handler=self.vnnlib_handler,
         interm_bounds=interm_bounds, or_spec_size=or_spec_size,
+        return_A=getattr(self, "_return_linear_bounds", False),
         full_alpha_info=True)
 
     if arguments.Config["general"]["return_optimized_model"]:
@@ -87,7 +91,11 @@ def incomplete_verifier(
         if "attack_examples" in ret:
             return "unsafe-pgd", {}
 
-    spec_handler.set_unverified_or_mask(global_lb)
+    if solving_mode:
+        new_global_lb = global_lb[:, 1:]
+        spec_handler.set_unverified_or_mask(new_global_lb)
+    else:
+        spec_handler.set_unverified_or_mask(global_lb)
 
     # check if all ORs are verified. If yes, return immediately.
     # Since all ORs are verified, we just need to return the status.
@@ -156,7 +164,7 @@ class SpecHandler:
         solver_args = arguments.Config["solver"]
         prune_after_crown = solver_args["prune_after_crown"]
         bounding_method = solver_args['bound_prop_method']
-        prune_after_crown = prune_after_crown and bounding_method == "alpha-crown"
+        prune_after_crown = prune_after_crown and bounding_method in ["alpha-crown", "beta-crown"]
         apply_output_constraints_to = solver_args["invprop"]["apply_output_constraints_to"]
         if arguments.Config['general']['store_all_specs_on_cpu']:
             device = "cpu"

@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -287,6 +287,12 @@ def input_bab_parallel(net: LiRPANet, x: BoundedTensor, c: Tensor, rhs: Tensor,
     presplit_domains = input_split_args["presplit_domains"]
     use_reordered_bab = input_split_args["reorder_bab"]
     split_hint = input_split_args["split_hint"]
+    # In solving mode, RHS is updated using attack-derived primals and represents
+    # the current best upper bound. Allow a small tolerance so near-zero
+    # numerical noise does not keep input BaB alive after the optimum is
+    # effectively certified.
+    solving_mode = bool(input_split_args["update_rhs_with_attack"])
+    solving_stop_tol = 1e-6 if solving_mode else 0.0
 
     clip_n_verify_args = bab_args["clip_n_verify"]
     clip_input_args = clip_n_verify_args["clip_input_domain"]
@@ -431,7 +437,7 @@ def input_bab_parallel(net: LiRPANet, x: BoundedTensor, c: Tensor, rhs: Tensor,
         constraints = None
         # Construct constraints matrices if use complete clip.
         if constrained_concretize:
-            # Constraints matrices will come from the output node A matrices and b matrics from last CROWN call
+            # Constraints matrices will come from the output node A matrices and b matrices from last CROWN call
             current_batch_size = dm_l.shape[0]
             current_x_dim = dm_l.view((current_batch_size, -1)).shape[1]
             constraints = construct_constraints(lA, lbias, rhs, current_batch_size, current_x_dim)
@@ -463,7 +469,7 @@ def input_bab_parallel(net: LiRPANet, x: BoundedTensor, c: Tensor, rhs: Tensor,
         constraints = None
         # Construct constraints matrices if constrained concretize is enabled.
         if constrained_concretize:
-            # Constraints matrices will come from the output node A matrices and b matrics from last CROWN call
+            # Constraints matrices will come from the output node A matrices and b matrices from last CROWN call
             lbias = deconstruct_bias(dm_l, dm_u, lA, global_lb)
             current_batch_size = dm_l.shape[0]
             current_x_dim = dm_l.view((current_batch_size, -1)).shape[1]
@@ -532,6 +538,20 @@ def input_bab_parallel(net: LiRPANet, x: BoundedTensor, c: Tensor, rhs: Tensor,
             stop_criterion=stop_criterion, split_partitions=split_partitions,
             use_reordered_bab=use_reordered_bab, stats=stats)
         batch = check_auto_enlarge_batch_size(auto_batch_size)
+
+        if solving_mode:
+            if isinstance(global_lb, torch.Tensor):
+                # global_lb is (lb - rhs). Stop once the worst-case gap reaches zero.
+                current_gap = float(global_lb.min().item())
+            else:
+                current_gap = float(global_lb)
+            if current_gap >= -solving_stop_tol:
+                print(
+                    "Optimization early stop: lower bound reached current threshold "
+                    f"within tolerance (gap={current_gap}, tol={solving_stop_tol})."
+                )
+                result = "safe"
+                break
 
 
         if time.time() - start > timeout:

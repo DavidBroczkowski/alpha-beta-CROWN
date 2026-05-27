@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -35,11 +35,10 @@ def repeat(x, num_copy, unsqueeze=False):
 
 
 class DomainUpdater:
-    def __init__(self, root, final_name, split_nodes):
-        self.root = root
-        self.final_name = final_name
-        self.split_nodes = split_nodes
 
+    def __init__(self, final_name, split_nodes_names):
+        self.final_name = final_name
+        self.split_nodes_names = split_nodes_names
         self.device = 'cpu'
         self.node_names = []
         cut_args = arguments.Config['bab']['cut']
@@ -151,8 +150,8 @@ class DomainUpdater:
                 for cur_split in range(self.num_split):
                     # FIXME Inconsistent node index for new_history (split_indices)
                     # and elsewhere.
-                    node, idx = split['decision'][cur_split*self.num_domain+i]
-                    node = self.split_nodes[node].name
+                    layer_idx, idx = split['decision'][cur_split*self.num_domain+i]
+                    node = self.split_nodes_names[layer_idx]
                     # # TODO Allow some branching points to be invalid
 
                     if mode == 'depth':
@@ -211,7 +210,7 @@ class DomainUpdater:
                     # x[4] is the depth of the split
                     # this block is to find the maximum depth of the split
                     # in the current domain
-                    # ONLY used in multi-tree-shearching
+                    # ONLY used in multi-tree-searching
                     if self.multi_tree_searching:
                         for x in self.new_history[i].values():
                             if isinstance(x[4], list):
@@ -235,8 +234,8 @@ class DomainUpdater:
             for cur_split in range(self.num_split):
                 # FIXME Inconsistent node index for new_history (split_indices)
                 # and elsewhere.
-                node, idx = split['decision'][cur_split*self.num_domain+i]
-                node = self.split_nodes[node].name
+                layer_idx, idx = split['decision'][cur_split*self.num_domain+i]
+                node = self.split_nodes_names[layer_idx]
                 if split.get('points', None) is not None:
                     points = split['points'][cur_split*self.num_domain+i]
                 else:
@@ -321,8 +320,8 @@ class DomainUpdaterSimple(DomainUpdater):
         for i in range(self.num_domain):
             # FIXME Inconsistent node index for new_history (split_indices)
             # and elsewhere.
-            node, idx = split['decision'][i]
-            node = self.split_nodes[node].name
+            layer_idx, idx = split['decision'][i]
+            node = self.split_nodes_names[layer_idx]
             points = split['points'][i] if branching_points else None
             for j in range(2):
                 history_idx = (-self.num_copy * self.num_domain

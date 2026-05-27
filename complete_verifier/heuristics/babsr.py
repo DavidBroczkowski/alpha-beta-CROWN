@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -17,6 +17,7 @@ import torch
 import numpy as np
 
 from heuristics.base import NeuronBranchingHeuristic
+from heuristics.decision_types import BranchingDecisions
 from heuristics.utils import compute_ratio, get_preact_params
 from utils import get_reduce_op, get_batch_size_from_masks
 
@@ -107,6 +108,7 @@ def babsr_score(lower_bounds, upper_bounds, lAs,
             raise ValueError(f'Unknown prioritize_alphas parameter {prioritize_alphas}')
 
         ratio = lAs[lA_key]
+        ratio = ratio.contiguous()
         ratio_temp_0, ratio_temp_1 = compute_ratio(
             lower_bounds[key], upper_bounds[key])
 
@@ -153,7 +155,7 @@ def babsr_score(lower_bounds, upper_bounds, lAs,
                     f'avg {remaining_branches.sum().item() / remaining_branches.numel()}')
         else:
             adjusted_score_candidate = score_candidate
-        # alpha score, the main score in BaBSR. A higher (more positive) score is batter.
+        # alpha score, the main score in BaBSR. A higher (more positive) score is better.
         score.insert(0, adjusted_score_candidate)
 
         relu_idx -= 1
@@ -166,7 +168,7 @@ class BabsrBranching(NeuronBranchingHeuristic):
         self.icp_score_counter = 0
 
     @torch.no_grad()
-    def get_branching_decisions(self, domains, split_depth,
+    def compute_branching_decisions(self, domains, split_depth,
                                 branching_reduceop='min',
                                 prioritize_alphas='none',
                                 sparsest_layer=0, max_info_threshold=0.001,
@@ -246,4 +248,9 @@ class BabsrBranching(NeuronBranchingHeuristic):
                     range(split_depth)]  # change the order of final decision to split_depth * batch
         decision = sum(decision, [])
 
-        return decision, None, split_depth  # None for points
+        return BranchingDecisions(
+            branching_decision=decision,
+            branching_points=None,
+            split_depth=split_depth,
+            batch_size=batch,
+        )

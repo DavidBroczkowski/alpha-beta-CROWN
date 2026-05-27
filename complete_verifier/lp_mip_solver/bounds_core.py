@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -32,6 +32,10 @@ except:  # pylint: disable=bare-except
 from auto_LiRPA.bound_ops import BoundConv, BoundLinear, BoundBatchNormalization, BoundAdd
 from utils import get_reduce_op, get_batch_size_from_masks
 import torch.nn as nn
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from beta_CROWN_solver import LiRPANet
 
 
 def lp_solver(candidate):
@@ -352,7 +356,7 @@ def all_node_split_LP(arg):
         if termination_flag_lp.value == 1:
             # Stop if a counterexample is already found
             return 'unknown', dix, float('inf'), None  
-        
+
         all_node_model = copy_model(multiprocess_lp_model, basis=False, env=env)
         all_node_model = update_model_bounds(all_node_model, lower_bounds, upper_bounds,
                                             pre_relu_layer_names, relu_layer_names, 'lp')
@@ -406,7 +410,9 @@ def all_node_split_LP(arg):
         return lp_status, dix, float(glb), counterexample
 
 
-def batch_verification_all_node_split_LP(net, d, ret, split, stats):
+def batch_verification_all_node_split_LP(
+    net: "LiRPANet", d, ret, split, stats, working_interm_info
+):
     global termination_flag_lp
     global multiprocess_lp_model
     global input_name
@@ -421,7 +427,6 @@ def batch_verification_all_node_split_LP(net, d, ret, split, stats):
     input_name = net.input_name
     orig = net.net.final_node().solver_vars
     orig_out_vars = [orig[out_idx].VarName for out_idx in range(len(orig))]
-    
 
     if mip_multi_proc is None:
         mip_multi_proc = multiprocessing.cpu_count()
@@ -432,7 +437,7 @@ def batch_verification_all_node_split_LP(net, d, ret, split, stats):
     dom_lb = ret['lower_bounds'][net.final_name]
     dom_ub = ret['upper_bounds'][net.final_name]
     # ret only contains the last layer bounds, we need to also collect all the intermediate bounds
-    dom_lb_all, dom_ub_all, _ = net.get_interm_bounds(lb=dom_lb, ub=dom_ub, init=True)
+    dom_lb_all, dom_ub_all = working_interm_info.to_complete_init_bounds(net, dom_lb, dom_ub)
     check_lp_cut(d['lower_bounds'], d['upper_bounds'], dom_lb_all, split, d['history'])
     dom_lb_all = [dom_lb_all[layer.name].to('cpu') for layer in net.split_nodes] + [dom_lb_all[net.final_name]]
     dom_ub_all = [dom_ub_all[layer.name].to('cpu') for layer in net.split_nodes] + [dom_ub_all[net.final_name]]

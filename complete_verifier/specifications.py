@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -362,7 +362,7 @@ class vnnlibHandler:
         if not is_linf_norm:
             # [num_or]
             self.eps = self.eps.repeat_interleave(num_or_per_x_list, dim=0)
-        
+
         # Initialize other attributes
         # c's in c_list and rhs's in rhs_list may have ununiformed shapes,
         # to minimize padding, we store the flattened c's and rhs's
@@ -443,9 +443,18 @@ class vnnlibHandler:
 
         norm = arguments.Config['specification']['norm']
         if self.is_linf_norm:
-            ptb = PerturbationLpNorm(norm=norm, x_L=batch_data_min, x_U=batch_data_max)
+            ptb = PerturbationLpNorm(
+                norm=norm,
+                x_L=batch_data_min,
+                x_U=batch_data_max,
+            )
         else:
-            ptb = PerturbationLpNorm(norm=norm, eps=self.eps[start_idx].item(), x_L=batch_data_min, x_U=batch_data_max)
+            ptb = PerturbationLpNorm(
+                norm=norm,
+                eps=self.eps[start_idx].item(),
+                x_L=batch_data_min,
+                x_U=batch_data_max,
+            )
         batch_x = BoundedTensor(batch_x, ptb)
 
         batched_specs = BatchedSpecs(

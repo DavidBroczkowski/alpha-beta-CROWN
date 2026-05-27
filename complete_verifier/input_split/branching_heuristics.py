@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -180,6 +180,6 @@ def input_split_heuristic_bf(net, x_L, x_U, dom_lb, thresholds, lA):
         print('Bad objective. Using SB.')
 
     if torch.isnan(margin).any():
-        import pdb; pdb.set_trace()
+        pass
 
     return index

@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -22,6 +22,8 @@ from auto_LiRPA.perturbations import PerturbationLpNorm
 from auto_LiRPA.utils import stop_criterion_batch_any
 
 from typing import TYPE_CHECKING, Optional, Tuple, Callable
+from state import AlphaValueData
+
 if TYPE_CHECKING:
     from beta_CROWN_solver import LiRPANet
 
@@ -64,7 +66,7 @@ def get_lower_bound_naive(
     :param constraints:                 A tuple of (constraints_A, constraints_b).
     :param stats:                       Statistics recorder.
     :return lb:                         The lower bound of the network output
-    :return ret_s:                      Returns the updated alphas for each subdomain
+    :return ret_alphas:                      Returns the updated alphas for each subdomain
     :return lA:                         If available, the bounding hyperplane coefficients
     :return lbias:                      If available, the bounding hyperplane offsets
     """
@@ -84,9 +86,10 @@ def get_lower_bound_naive(
     ptb = PerturbationLpNorm(x_L=dm_l, x_U=dm_u,
         constraints=constraints, rearrange_constraints=rearrange_constraints, no_return_inf=enable_constrained_concretize,
         timer=stats.timer)
-    new_x = BoundedTensor(dm_l, ptb)  # the value of new_x doesn't matter, only pdb matters
+    new_x = BoundedTensor(dm_l, ptb)  # the value of new_x doesn't matter, only ptb matters
     # set alpha here again
-    self.set_alpha(alphas, set_all=True)
+    # self.alpha_assign_working_to_net(alphas, set_all=True)
+    AlphaValueData.from_domain_dict({"alphas": alphas}).attach_to_net(self)
     self.net.set_bound_opts({'optimize_bound_args': {
         'enable_beta_crown': False,
         'fix_interm_bounds': True,
@@ -151,7 +154,7 @@ def get_lower_bound_naive(
                 if infeasible_batch is not None:
                     lb[infeasible_batch] = torch.inf
 
-        # dm_lb is not None if compare_with_old_bounds is True, 
+        # dm_lb is not None if compare_with_old_bounds is True,
         if dm_lb is not None:
             lb = torch.max(lb, dm_lb)
 
@@ -160,16 +163,20 @@ def get_lower_bound_naive(
 
     with torch.no_grad():
         if bounding_method == "alpha-crown":
-            ret_s = self.get_alpha(
-                get_all=True,
-                half=arguments.Config["solver"]["alpha-crown"]["alpha_dtype"] == "float16"
-            )
+            # ret_alphas = self.alpha_get_from_net(
+            #     get_all=True,
+            #     half=arguments.Config["solver"]["alpha-crown"]["alpha_dtype"]
+            #     == "float16",
+            # )
+            ret_alphas = AlphaValueData.from_net(self, starting_node_scope="all", move=False)
+            if arguments.Config["solver"]["alpha-crown"]["alpha_dtype"] == "float16":
+                ret_alphas = ret_alphas.to(dtype=torch.float16)
         else:
             # There might be alphas in initial alpha-crown,
             # which will be used in all later bounding steps.
-            ret_s = alphas
+            ret_alphas = alphas
 
-    return lb, ret_s, lA, lbias
+    return lb, ret_alphas, lA, lbias
 
 
 def get_lower_bound_with_ibp_enhancement(
@@ -194,7 +201,7 @@ def get_lower_bound_with_ibp_enhancement(
     :param stop_criterion:      Callable function which returns True for domains that have been verified
     :param constraints:         A tuple of (constraints_A, constraints_b)
     :param timer:               A time recorder.
-    :paran rearrange_constraints:
+    :param rearrange_constraints:
                                 Whether to rearrange the constraints based on their distances to input region centroids.
     :param no_return_inf:       Whether inf value is allowed in intermediate bound.
 

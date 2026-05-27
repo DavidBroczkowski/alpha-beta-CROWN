@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -20,12 +20,14 @@ import torch
 
 import arguments
 from beta_CROWN_solver import LiRPANet
+from domain_utils import DomainDB
 from attack import check_and_save_cex
 from utils import Logger, print_model, take_batch
 from specifications import BatchedSpecs
-from bab import general_bab
+from activation_split.bab_bootstrap import general_bab
 from input_split.batch_branch_and_bound import input_bab_parallel
 from cuts.cut_utils import terminate_mip_processes_by_c_matching, clean_net_mps_process
+from cuts.cplex_cut_recorder import CplexCutRecorder
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -46,6 +48,22 @@ def bab(self: 'ABCROWN',
         device = arguments.Config['general']['device']
     all_specs: BatchedSpecs = self.vnnlib_handler.all_specs
     x, c, rhs, or_spec_size, _, _ = all_specs.get(device)
+
+    solving_mode = arguments.Config["solving"]["solving_mode"]
+    obj_index = arguments.Config["solving"]["obj_index"]
+    if solving_mode:
+        assert c.shape[0] == 1, "For now, solving mode does not support multiple OR."
+        # Model output dimension
+        output_dim = c.shape[2]
+        # TODO: Maybe the shape checking here is unecessary?
+        assert (rhs.shape[0] == 1) and (rhs.shape[1] == c.shape[1]), "C and rhs shape do not match!"
+        assert obj_index < output_dim, "Objective index exceeds range!"
+        new_one_hot = torch.zeros((1, 1, output_dim), device=c.device)
+        new_one_hot[0, 0, obj_index] = 1
+        c = torch.cat((new_one_hot, c), dim=1)
+        new_rhs = torch.zeros((1, 1), device=rhs.device)
+        rhs = torch.cat((new_rhs, rhs), dim=1)
+
     vnnlib = self.vnnlib_handler.vnnlib
 
     enable_cuts = arguments.Config['bab']['cut']['enabled']
@@ -101,20 +119,46 @@ def bab(self: 'ABCROWN',
 
         result = [float("inf"), 0, "safe"]
 
+        total_visited_domain = DomainDB.new_db()
+        save_visited_domains_to = arguments.Config['bab']['branching']['save_visited_domains_to']
+
         # this for loop will only execute once or total_num_or_spec times
         for batch_idx in range(num_batches):
             print(f'Activation BaB batch {batch_idx + 1}/{num_batches} ')
+
+            # Create recorder instance for this iteration
+            record_dir = arguments.Config["bab"]["cut"]["record_cplex_cut_to"]
+            replay_dir = arguments.Config["bab"]["cut"]["read_cplex_cut_from"]
+            recorder = None
+            if record_dir is not None or replay_dir is not None:
+                recorder = CplexCutRecorder(
+                    batch_id=batch_idx, record_csv_basepath=record_dir, replay_csv_basepath=replay_dir
+                )
+            lirpa_model.recorder = recorder
+
             batch_x, batch_c, batch_rhs, batch_reference_dict = prepare_for_act_bab(
                 x, c, rhs, reference_dict, bab_batch_size, batch_idx)
 
             batch_result = general_bab(
-                lirpa_model, batch_x, batch_c, batch_rhs,
+                lirpa_model,
+                batch_x,
+                batch_c,
+                batch_rhs,
                 reference_dict=batch_reference_dict,
-                timeout=timeout, max_iterations=max_iterations)
+                timeout=timeout,
+                max_iterations=max_iterations,
+            )
 
             if cplex_cuts:
                 solved_c_list.append(batch_c)
                 terminate_mip_processes_by_c_matching(lirpa_model.processes, solved_c_list)
+
+            if save_visited_domains_to != '':
+                assert len(batch_result) == 4, "Please check the return value of general_bab."
+                stats = batch_result[3]
+                stats.domainDB.dump(save_visited_domains_to, batch_idx if num_batches > 1 else None)
+                print(f'DomainDB saved to {save_visited_domains_to}')
+                total_visited_domain.merge(stats.domainDB)
 
             batch_result = _format_result_act_bab(batch_result, lirpa_model, vnnlib)
 
@@ -127,8 +171,17 @@ def bab(self: 'ABCROWN',
                 # can be 'unsafe_bab' or 'unknown'
                 result[2] = batch_result[2]
                 break
+
+            if lirpa_model.recorder is not None:
+                lirpa_model.recorder.report()
+
         if enable_cuts:
             clean_net_mps_process(lirpa_model)
+
+        if save_visited_domains_to != '':
+            total_visited_domain.dump(save_visited_domains_to)
+            print(f'(Union of all) DomainDB saved to {save_visited_domains_to}')
+
     # return global lb, number of domains visited, and status
     return result
 

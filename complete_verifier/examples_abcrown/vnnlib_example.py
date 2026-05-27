@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -18,12 +18,12 @@
 from abcrown import (
     ABCrownSolver,
     ConfigBuilder,
-    VerificationSpec
+    IOConstraints,
 )
 
 vnnlib_path = "vnnlib_example_dependency/cifar_base_kw-img876-eps0.024836601307189544.vnnlib"
 
-spec = VerificationSpec.build_spec(vnnlib_path=vnnlib_path)
+constraints = IOConstraints(vnnlib_path=vnnlib_path)
 
 config = ConfigBuilder.from_yaml(
     "../exp_configs/vnncomp22/oval22.yaml"
@@ -31,7 +31,7 @@ config = ConfigBuilder.from_yaml(
 
 model_path = "vnnlib_example_dependency/cifar_base_kw.onnx"
 
-solver = ABCrownSolver(spec, model_path, config=config)
-result = solver.solve()
+solver = ABCrownSolver(model_path, config=config)
+result = solver.verify(constraints=constraints)
 
 print(f"status={result.status}, success={result.success}")

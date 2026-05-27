@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -21,6 +21,8 @@ import torch
 from psutil import NoSuchProcess
 from collections import defaultdict
 import numpy as np
+from typing import Optional
+from cuts.cplex_cut_recorder import CplexCutRecorder
 
 def read_cut(cut_file):
     # read linear constraints from file
@@ -280,16 +282,66 @@ def parse_cplex_cuts(cut_bin, var_names, relu_layer_names, pre_relu_layer_names)
         return None, -1
 
 
-def fetch_cut_from_cplex(net, sync_to_net=True):
+def fetch_cut_from_cplex(
+    net, 
+    sync_to_net=True, 
+    recorder: Optional[CplexCutRecorder] = None,
+):
     """
     :param net: AutoLiRPA instance
     :param sync_to_net:
-    whether to inject the loaded cut into the instance, when called inside bab loops, it is true;
-    when called right before the bab loop, it is false.
+        whether to inject the loaded cut into the instance, when called inside bab loops, it is true;
+        when called right before the bab loop, it is false.
+    :param recorder: CplexCutRecorder instance for recording/replaying cuts.
+        When recorder.replay_csv_path is not None, replay cuts from the path;
+        when recorder.record_csv_path is not None, record cuts to the path.
+        If None, perform neither recording nor replaying and directly fetch from cplex files.
     :return:
+        cuts: list of cuts loaded from cplex files or recorder
+        cut_timestamp: timestamp of the cuts
     """
     start_time = time.time()
-    ######## parse cplex cuts files ###########
+
+    record_cut_flag = recorder is not None and recorder.record_csv_path is not None
+    replay_cut_flag = recorder is not None and recorder.replay_csv_path is not None
+    assert not (record_cut_flag and replay_cut_flag), "Cannot record and replay cuts at the same time."
+
+    # Replay recorded cuts and return directly
+    if replay_cut_flag:
+        replay_cuts, replay_cut_timestamp = recorder.read_cplex_cut_from()
+        cuts = replay_cuts
+        cut_timestamp = replay_cut_timestamp
+
+        if cuts is not None:
+            if sync_to_net:
+                # recreate the global cut_module
+                net.cutter.cuts = cuts
+                net.cutter.cut_timestamp = cut_timestamp
+
+                # construct new cut_module
+                cut_module = net.cutter.construct_cut_module()
+                net.net.cut_module = cut_module
+                net.net.cut_timestamp = cut_timestamp
+                for m in net.net.relus:
+                    m.cut_module = cut_module
+            if getattr(net.net, "var_names", None) is None:
+                try:
+                    var_names = recorder.load_var_names()
+                except FileNotFoundError as e:
+                    raise FileNotFoundError(
+                        "Failed to load CPLEX variable names during replay: "
+                        "the var_names file is missing. This can happen if cuts "
+                        "were recorded without saving var_names (e.g., when "
+                        "net.net.var_names was None during recording)."
+                    ) from e
+                net.net.var_names = var_names
+                print("(replay) CPLEX cuts names loaded.")
+            print(f"(replay) number of CPLEX cuts loaded: {len(cuts)}")
+
+        print(f"(replay) Cut preparation time: {time.time() - start_time:.4f}")
+        return cuts, cut_timestamp
+
+    ####### parse cplex cuts files ###########
     if (
         net.mip_building_proc is not None
         and net.mip_building_proc.exitcode is not None
@@ -298,11 +350,18 @@ def fetch_cut_from_cplex(net, sync_to_net=True):
         print("********CRITICAL WARNING (DO NOT IGNORE!)********")
         print(f"MIP building process is not terminated correctly. Cutting planes are not being used. Please STOP and check! Return code {net.mip_building_proc.exitcode}")
         print("********CRITICAL WARNING (DO NOT IGNORE!)********")
+        if record_cut_flag:
+            recorder.record_cplex_cut_to(None, -1)
         return None, -1
+
     process_dict = getattr(net, 'processes', None)
+    cuts, cut_timestamp = None, -1
     if process_dict is None:
-        print('Fetch cut process: mps construction process is still running')
+        print("Fetch cut process: mps construction process is still running")
+        cuts = None
+        cut_timestamp = -1
     else:
+        matched = False
         for key, value in process_dict.items():
             if (value['c'] == net.c.detach().cpu()).all():
                 print("Matched cut cplex process, internal label idx = {}".format(key))
@@ -327,9 +386,19 @@ def fetch_cut_from_cplex(net, sync_to_net=True):
                 else:
                     cuts, cut_timestamp = None, -1
                 print(f'cuts preparing time: {time.time() - start_time:.4f}')
-                return cuts, cut_timestamp
-        print('Fetch cut process: mps for current label is not ready yet')
-    return None, -1
+                matched = True
+                break
+        if not matched:
+            print('Fetch cut process: mps for current label is not ready yet')
+            cuts, cut_timestamp = None, -1
+
+    if record_cut_flag:
+        recorder.record_cplex_cut_to(cuts, cut_timestamp)
+        if not recorder.saved_var_names and getattr(net.net, "var_names", None) is not None:
+            recorder.save_var_names(net.net.var_names)
+            print("CPLEX cuts names saved.")
+
+    return cuts, cut_timestamp
 
 
 def close_cut_log(processes, pidx):
@@ -357,8 +426,10 @@ def remove_cut_files(processes, pidx):
                 print(f'failed to remove {file_to_remove}')
 
 
-def terminate_mip_processes(mip_building_proc, processes):
+def terminate_mip_processes(mip_building_proc, processes, watch_dog_proc=None):
     """terminate mip processes. """
+    if processes is None:
+        return
     # first, terminate the mip model building process
     while mip_building_proc.is_alive():
         print('the mip building process is not terminated yet, kill it')
@@ -366,18 +437,39 @@ def terminate_mip_processes(mip_building_proc, processes):
         # FIXME However, this case is really rare so we just skip it for now
         mip_building_proc.terminate()
         time.sleep(0.2)
+    # Kill the watchdog so it does not spawn new get_cuts subprocesses during cleanup.
+    if watch_dog_proc is not None and watch_dog_proc.is_alive():
+        print('killing get_cuts watchdog process')
+        watch_dog_proc.kill()
+        watch_dog_proc.join()
     for pidx in processes:
         print('found process for pidx={}'.format(pidx))
+        entry = dict(processes[pidx])
+        if 'pid' not in entry:
+            print(f'no get_cuts subprocess was spawned for pidx={pidx}, skipping kill')
+            remove_cut_files(processes, pidx)
+            continue
+        tried_kill = False
+        retries = 100
         while True:
-            if psutil.pid_exists(processes[pidx]['pid']):
+            pid = entry['pid']
+            if psutil.pid_exists(pid):
                 print('kill process for pidx={}'.format(pidx))
                 try:
-                    psutil.Process(processes[pidx]['pid']).kill()
+                    if tried_kill:
+                        psutil.Process(pid).terminate()
+                    else:
+                        tried_kill = True
+                        psutil.Process(pid).kill()
                 except NoSuchProcess as e:
                     print('process already terminated, no need to kill')
             else:
                 break
-            time.sleep(0.2)
+            if retries <= 0:
+                print('failed to terminate process for pidx={} pid={}'.format(pidx, pid))
+                break
+            retries -= 1
+            time.sleep(0.1)
 
         close_cut_log(processes, pidx)
         remove_cut_files(processes, pidx)
@@ -404,9 +496,13 @@ def terminate_mip_processes_by_c_matching(processes, c_list):
     for k, value in processes.items():
         if any([(value['c'] == c).all().item() for c in c_list]):
             print('found process to kill: terminal indx = {}'.format(k))
-            if psutil.pid_exists(processes[k]['pid']):
+            if 'pid' not in value:
+                print(f'no get_cuts subprocess was spawned for pidx={k}, skipping kill')
+                remove_cut_files(processes, k)
+                continue
+            if psutil.pid_exists(value['pid']):
                 try:
-                    psutil.Process(processes[k]['pid']).kill()
+                    psutil.Process(value['pid']).kill()
                 except NoSuchProcess as e:
                     print('process already terminated, no need to kill')
             else:
@@ -416,12 +512,27 @@ def terminate_mip_processes_by_c_matching(processes, c_list):
             remove_cut_files(processes, k)
 
 
-def generate_cplex_cuts(net):
+def generate_cplex_cuts(net, recorder: Optional[CplexCutRecorder] = None):
     ######## parse cplex cuts files ###########
-    cuts, cut_timestamp = fetch_cut_from_cplex(net, sync_to_net=False)
+    cuts, cut_timestamp = fetch_cut_from_cplex(
+        net, sync_to_net=False, recorder=recorder
+    )
     # we manually assign the cut to net instance
     net.cutter.cuts = cuts
     net.cutter.cut_timestamp = cut_timestamp
+
+def _kill_watch_dog(net):
+    """Kill the get_cuts watchdog process if it exists.
+
+    Must be called before killing individual get_cuts subprocesses so
+    the watchdog does not spawn new ones after cleanup.
+    """
+    watch_dog = net.get_cuts_watch_dog_proc
+    if watch_dog is not None and watch_dog.is_alive():
+        print('killing get_cuts watchdog process')
+        watch_dog.kill()
+        watch_dog.join()
+
 
 def clean_net_mps_process(net):
     """
@@ -438,21 +549,41 @@ def clean_net_mps_process(net):
             net.mip_building_proc.kill()
             net.mip_building_proc.join()
             time.sleep(0.2)
+        # Kill the watchdog before cleaning up get_cuts subprocesses
+        # so it does not spawn new ones during cleanup.
+        _kill_watch_dog(net)
         for pidx in net.processes:
             print('found process for pidx={}'.format(pidx))
+            entry = dict(net.processes[pidx])
+            if 'pid' not in entry:
+                # Watchdog never spawned a get_cuts subprocess for this entry
+                print(f'no get_cuts subprocess was spawned for pidx={pidx}, skipping kill')
+                remove_cut_files(net.processes, pidx)
+                continue
+            tried_kill = False
+            retries = 20
             while True:
-                if psutil.pid_exists(net.processes[pidx]['pid']):
-                    print('kill process for pidx={}'.format(pidx))
+                pid = entry['pid']
+                if psutil.pid_exists(pid):
+                    print('kill process for pidx={} pid={}'.format(pidx, pid))
                     try:
-                        psutil.Process(net.processes[pidx]['pid']).kill()
+                        if tried_kill:
+                            psutil.Process(pid).terminate()
+                        else:
+                            tried_kill = True
+                            psutil.Process(pid).kill()
                     except NoSuchProcess as e:
                         print('process already terminated, no need to kill')
                 else:
                     break
-                time.sleep(0.2)
+                if retries <= 0:
+                    print('failed to terminate process for pidx={} pid={}'.format(pidx, pid))
+                    break
+                retries -= 1
+                time.sleep(0.1)
             # Close log file.
-            if '_logfile' in net.processes[pidx] and net.processes[pidx]['_logfile'] is not None:
-                try: os.close(net.processes[pidx]['_logfile'])
+            if '_logfile' in entry and entry['_logfile'] is not None:
+                try: os.close(entry['_logfile'])
                 except: pass
             remove_cut_files(net.processes, pidx)
 

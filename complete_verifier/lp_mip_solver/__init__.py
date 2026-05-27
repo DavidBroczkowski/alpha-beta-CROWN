@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -24,6 +24,9 @@ import multiprocessing
 import numpy as np
 import subprocess
 import signal
+import ctypes
+import sys
+
 from attack import check_and_save_cex
 
 # Import core functionality from modular files
@@ -31,7 +34,8 @@ from .mip_core import MIPSolver, VerificationResult, SolverResult
 from .utils import (
     mip_solver_lb_ub, mip_solver_lb_ub_and, update_mip_model_fix_relu,
     mip_solver_attack, copy_model, handle_gurobi_error,
-    clamp, compute_ratio, FSB_score, NoDaemonProcess, NestablePool
+    clamp, compute_ratio, FSB_score, NoDaemonProcess, NestablePool,
+    _set_pdeathsig
 )
 from .bounds_core import (
     update_model_bounds, all_node_split_LP, batch_verification_all_node_split_LP,
@@ -408,16 +412,7 @@ def build_the_model_mip_or(m, labels_to_verify=None, save_mps=False, process_dic
         for pidx in model_filename_stamped_dict:
             model_filename_stamped = model_filename_stamped_dict[pidx]
             model_c_row = model_c_row_dict[pidx].detach().cpu()
-            try:
-                proc, logfile = run_get_cuts_subprocess(model_filename_stamped)
-                processes[pidx] = {'pid': proc.pid, '_logfile': logfile,
-                                   '_fname_stamped': model_filename_stamped, 'c': model_c_row}
-            except Exception as exc:
-                try:
-                    proc.kill()
-                except Exception:  # pragma: no cover - best effort cleanup
-                    pass
-                raise exc
+            processes[pidx] = {'_fname_stamped': model_filename_stamped, 'c': model_c_row}
 
         del m.net.solver_model
         return None, None, None, processes
@@ -490,7 +485,6 @@ def _signal_handler(signum, frame):
         save_mps_pool.terminate()
     exit(0)
 
-
 def run_get_cuts_subprocess(model_filename):
     """Launch external cuts solver (legacy helper)."""
     cut_file_path = f"{model_filename}.cuts"
@@ -510,9 +504,42 @@ def run_get_cuts_subprocess(model_filename):
         f"{arguments.Config['bab']['cut']['cuts_path']}/get_cuts",
         f"{model_filename}.mps",
         f"{model_filename}"
-    ], stderr=subprocess.STDOUT, stdout=logfile)
+    ], stderr=subprocess.STDOUT, stdout=logfile, preexec_fn=_set_pdeathsig)
     logfile_fd = logfile.fileno() if logfile is not None else None
     return proc, logfile_fd
+
+
+def watch_dog_get_cuts(processes):
+    """Monitor shared processes dict and spawn get_cuts subprocesses for each spec. 
+    Kill all subprocesses on parent termination. 
+    """
+    _set_pdeathsig()
+    spawned = set()
+    while True:
+        current_keys = list(processes.keys())
+        for pidx in current_keys:
+            if pidx in spawned:
+                continue
+            entry = dict(processes[pidx])
+            if 'pid' in entry:
+                spawned.add(pidx)
+                continue
+            model_filename_stamped = entry['_fname_stamped']
+            proc = None
+            try:
+                proc, logfile = run_get_cuts_subprocess(model_filename_stamped)
+            except Exception as exc:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise exc
+            entry['pid'] = proc.pid
+            entry['_logfile'] = logfile
+            processes[pidx] = entry
+            spawned.add(pidx)
+        time.sleep(0.5)
 
 
 def build_the_model_mip_and(m, save_adv=False, x=None, intermediate_bounds=None,
@@ -628,5 +655,6 @@ __all__ = [
     'NestablePool',
     '_build_the_model_mip_mps_save',
     '_signal_handler',
+    'watch_dog_get_cuts',
     'check_optimization_success'
 ] 

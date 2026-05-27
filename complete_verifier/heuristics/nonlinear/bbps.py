@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -121,7 +121,7 @@ class NonlinearBranching(NeuronBranchingHeuristic):
 
         return layers, indices, points
 
-    def get_branching_decisions(self, domains, split_depth=1,
+    def compute_branching_decisions(self, domains, split_depth=1,
                                 branching_candidates=1, verbose=False,
                                 branching_reduceop='min', **kwargs):
         # Only split_depth = 1 is supported for now
@@ -157,10 +157,9 @@ class NonlinearBranching(NeuronBranchingHeuristic):
                 'history': domains['history']
             })
         print('Start filtering...')
-        branching_decision, branching_points, _ = decisions
         split = {
-            'decision': branching_decision,
-            'points': branching_points,
+            'decision': decisions.branching_decision,
+            'points': decisions.branching_points,
         }
         self.net.build_history_and_set_bounds(
             args_update_bounds, split, mode='breadth')
@@ -279,7 +278,7 @@ class NonlinearBranching(NeuronBranchingHeuristic):
 
         start_nodes = [act[0] for act in self.net.split_activations[name]]
 
-        # Specicial cases for now
+        # Special cases for now
         if len(start_nodes) == 1:
             start_node = start_nodes[0]
             if isinstance(start_node, (BoundRelu, BoundSign, BoundSignMerge, BoundMul)):

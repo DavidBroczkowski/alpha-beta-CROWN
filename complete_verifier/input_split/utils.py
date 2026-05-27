@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -22,7 +22,7 @@ def initial_verify_criterion(lbs, rhs):
     # lbs: b, n_bounds (already multiplied with c in compute_bounds())
     verified_idx = torch.any(
         (lbs - rhs) > 0, dim=-1
-    )  # return bolling results in x's batch-wise
+    )  # return boolean results in x's batch-wise
     if verified_idx.all():  # check whether all x verified
         print("Verified by initial bound!")
         return True, torch.where(verified_idx == 0)[0]

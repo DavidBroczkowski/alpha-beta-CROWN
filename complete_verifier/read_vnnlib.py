@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -26,6 +26,29 @@ import re
 import hashlib
 import pickle
 import arguments
+
+
+def _is_valid_cached_vnnlib(final_rv):
+    """Return whether a cached vnnlib payload matches the expected structure."""
+    if not isinstance(final_rv, list):
+        return False
+    for item in final_rv:
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
+        _, spec_list = item
+        if not isinstance(spec_list, list):
+            return False
+        for spec in spec_list:
+            if not isinstance(spec, tuple) or len(spec) != 2:
+                return False
+            mat, rhs = spec
+            mat = np.asarray(mat)
+            rhs = np.asarray(rhs)
+            if mat.ndim != 2 or rhs.ndim != 1:
+                return False
+            if mat.shape[0] != rhs.shape[0]:
+                return False
+    return True
 
 
 def read_statements(vnnlib_filename):
@@ -188,8 +211,10 @@ def read_vnnlib(vnnlib_filename, regression=False):
             
             if (read_error == False):
                 if (curfile_sha256 == old_file_sha256):
-                    print(f"Precompiled vnnlib file found at {compiled_vnnlib_filename}")
-                    return final_rv
+                    if _is_valid_cached_vnnlib(final_rv):
+                        print(f"Precompiled vnnlib file found at {compiled_vnnlib_filename}")
+                        return final_rv
+                    print("Compiled vnnlib cache has incompatible structure. Regenerating...")
                 else:
                     print(f"{compiled_vnnlib_suffix} file sha256: {curfile_sha256} does not match the current vnnlib sha256: {old_file_sha256}. Regenerating...")
 
@@ -331,8 +356,12 @@ def read_vnnlib(vnnlib_filename, regression=False):
         spec_list = []
 
         for matrhs in rv_tuple[1]:
-            mat = np.array(matrhs[0], dtype=float)
-            rhs = np.array(matrhs[1], dtype=float)
+            if len(matrhs[0]) == 0:
+                mat = np.zeros((0, num_outputs), dtype=float)
+                rhs = np.zeros((0,), dtype=float)
+            else:
+                mat = np.array(matrhs[0], dtype=float)
+                rhs = np.array(matrhs[1], dtype=float)
             spec_list.append((mat, rhs))
             # final_spec.append(mat)
             # final_rhs.append(rhs)

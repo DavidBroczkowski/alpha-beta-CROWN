@@ -8,6 +8,7 @@
 # conda install appdirs blas bottleneck brotli-python bzip2 ca-certificates certifi cffi cfgv charset-normalizer cuda-cudart cuda-cupti cuda-libraries cuda-nvrtc cuda-nvtx cuda-opencl cuda-runtime cuda-version distlib ffmpeg filelock freetype gmp gmpy2 gnutls gurobi identify idna iniconfig intel-openmp jinja2 joblib jpeg lame lcms2 ld_impl_linux-64 lerc libcublas libcufft libcufile libcurand libcusolver libcusparse libdeflate libffi libgcc-ng libgfortran-ng libgfortran5 libgomp libiconv libidn2 libjpeg-turbo libnpp libnvjitlink libnvjpeg libpng libprotobuf libstdcxx-ng libtasn1 libtiff libunistring libuuid libwebp-base llvm-openmp lz4-c markdown-it-py markupsafe mdurl mkl mkl-service mkl_fft mkl_random mpc mpfr mpmath ncurses nettle networkx nodeenv numexpr openh264 openjpeg openssl packaging pandas pillow pip platformdirs pluggy pre-commit psutil pybind11-abi pycparser pygments pysocks pytest python python-dateutil python-tzdata pytorch pytorch-cuda pytorch-mutex pytz pyyaml readline requests rich scikit-learn scipy setuptools six sortedcontainers sqlite sympy tbb threadpoolctl tk torchaudio torchtriton torchvision tqdm typing-extensions typing_extensions tzdata ukkonen urllib3 virtualenv wheel xz yaml zlib zstd coloredlogs python-flatbuffers fsspec graphviz python-graphviz humanfriendly protobuf -c nvidia -c pytorch
 # pip install onnx==1.17.0 onnxruntime onnxoptimizer onnxsim skl2onnx
 # pip install --no-deps git+https://github.com/Verified-Intelligence/onnx2pytorch.git
+# pip install ray==2.54.0
 #
 # Then replace the line with onnx2pytorch with:
 # git+https://github.com/Verified-Intelligence/onnx2pytorch@8447c42c3192dad383e5598edc74dddac5706ee2#egg=onnx2pytorch
@@ -238,6 +239,7 @@ dependencies:
       - git+https://github.com/Verified-Intelligence/onnx2pytorch@8afb2243fddd1a4732883f1e2959f7e83f8201c5#egg=onnx2pytorch
       - onnxoptimizer==0.3.13
       - onnxsim==0.4.36
+      - ray==2.54.0
       - torch==2.7.0+cu128
       - torchaudio==2.7.0+cu128
       - torchvision==0.22.0+cu128

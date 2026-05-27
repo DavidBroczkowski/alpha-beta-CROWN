@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -22,16 +22,18 @@ from collections import defaultdict
 import torch
 
 import arguments
-from lp_mip_solver import CPLEX_FOLDER, construct_mip_with_model
+from lp_mip_solver import CPLEX_FOLDER, construct_mip_with_model, watch_dog_get_cuts
 from cuts.cut_utils import generate_cplex_cuts
 from cuts.cutter import Cutter
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+from cuts.cplex_cut_recorder import CplexCutRecorder
+
 if TYPE_CHECKING:
     from beta_CROWN_solver import LiRPANet
 
 
-def cut_verification(net, domains):
+def cut_verification(net, domains, recorder: Optional[CplexCutRecorder] = None):
     cut_args = arguments.Config['bab']['cut']
     lp_cut_enabled = cut_args['lp_cut']
     cplex_cuts = cut_args['cplex_cuts']
@@ -44,7 +46,7 @@ def cut_verification(net, domains):
         net.build_the_model_lp()
     if cplex_cuts:
         time.sleep(cplex_cuts_wait)
-        generate_cplex_cuts(net)
+        generate_cplex_cuts(net, recorder=recorder)
     if len(domains) >= 1 and getattr(net.cutter, 'opt', False):
         # beta will be reused from split_history
         assert len(domains) == 1
@@ -73,7 +75,7 @@ def set_cuts(self: 'LiRPANet'):
             # The indicated cut may be text contents of the cut file.
             # First try to load the cut file as a text file.
             # This is for the case you want to use the cut file as a text file.
-            # e.g. saved cut in dictionaly format.
+            # e.g. saved cut in dictionary format.
             cuts = read_cut(filename + '.cuts')
         except UnicodeDecodeError as e:
             # Then use to read the cut file as a binary file.
@@ -127,6 +129,13 @@ def create_mip_building_proc(self: 'LiRPANet', x):
         self.c.clone().cpu(), intermediate_bounds, True, self.processes))
     mip_building_proc.start()
     self.mip_building_proc = mip_building_proc
+
+    watchdog_proc = multiprocessing.Process(
+        target=watch_dog_get_cuts,
+        args=(self.processes,),
+        daemon=True)
+    watchdog_proc.start()
+    self.get_cuts_watch_dog_proc = watchdog_proc
 
 
 def enable_cuts(self: 'LiRPANet'):
@@ -183,10 +192,32 @@ def set_cut_params(self: 'LiRPANet', batch_size, batch_base, split_history):
     return iteration
 
 
-def set_cut_new_split_history(self: 'LiRPANet', new_split_history, batch_size):
-    for i in range(batch_size):
-        new_split_history[i]["general_betas"] = self.net.cut_module.general_beta[self.net.final_name][:, :, i:i + 1, :].detach()
-        new_split_history[i]["cut_timestamp"] = self.net.cut_module.cut_timestamps[i]
+def get_cut_new_split_history(self: 'LiRPANet', batch_size, mask_select=None) -> list[dict]:
+    """
+    Extract a batch of general cuts beta values and timestamps from net.
+
+    Args:
+        batch_size: The number of domains in this batch
+        mask_select: Select which domains are to extract.
+
+    Return
+        new_split_history: List[dict] whose length is equal to batch_size of mask_select.sum()
+    """
+    
+    if mask_select is not None:
+        new_split_history = [{} for _ in range(mask_select.sum().item())]
+        tar_i = 0
+        for i in range(batch_size):
+            if mask_select[i]:
+                new_split_history[tar_i]["general_betas"] = self.net.cut_module.general_beta[self.net.final_name][:, :, i:i + 1, :].detach()
+                new_split_history[tar_i]["cut_timestamp"] = self.net.cut_module.cut_timestamps[i]
+                tar_i += 1
+    else:
+        new_split_history = [{} for _ in range(batch_size)]
+        for i in range(batch_size):
+            new_split_history[i]["general_betas"] = self.net.cut_module.general_beta[self.net.final_name][:, :, i:i + 1, :].detach()
+            new_split_history[i]["cut_timestamp"] = self.net.cut_module.cut_timestamps[i]
+    return new_split_history
 
 
 def disable_cut_for_branching(self: 'LiRPANet'):

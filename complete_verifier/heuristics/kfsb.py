@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -13,9 +13,11 @@
 ##                                                                     ##
 #########################################################################
 from collections import defaultdict
+import gc
 import torch
 import numpy as np
 from heuristics.babsr import BabsrBranching, babsr_score, babsr_score_intercept_only
+from heuristics.decision_types import BranchingDecisions
 from utils import get_reduce_op, get_batch_size_from_masks
 
 
@@ -26,9 +28,9 @@ class KfsbBranching(BabsrBranching):
     """
 
     @torch.no_grad()
-    def get_branching_decisions(self, domains, split_depth, branching_candidates=5,
+    def compute_branching_decisions(self, domains, split_depth, branching_candidates=5,
                                 branching_reduceop='min', use_beta=False, keep_all_decision=False,
-                                prioritize_alphas='none',  method='kfsb', **kwargs):
+                                prioritize_alphas='none',  method='kfsb', timer=None, **kwargs):
 
         lower_bounds, upper_bounds = domains['lower_bounds'], domains['upper_bounds']
         orig_mask, lAs, cs = domains['mask'], domains['lAs'], domains['cs']
@@ -99,6 +101,7 @@ class KfsbBranching(BabsrBranching):
         set_alpha = True  # We only set the alpha once.
 
         reduce_op = get_reduce_op(branching_reduceop, with_dim=True)
+        if timer: timer.start('get_branching_decision.update_bounds')
         for k in range(topk):
             # top-k candidates from the alpha scores.
             decision_index = score_idx_indices[:, k]
@@ -148,6 +151,7 @@ class KfsbBranching(BabsrBranching):
                     fix_interm_bounds=True, shortcut=True,
                     beta_bias=False)
 
+
             # consider the max improvement among multi bounds in one C matrix
             k_ret_lbs = (k_ret_lbs - torch.cat([rhs, rhs])).max(-1).values
             # No need to set alpha next time; we do not optimize the alphas.
@@ -171,7 +175,7 @@ class KfsbBranching(BabsrBranching):
                 k_ret[k] = reduced_score
             else:
                 k_ret[k] = reduced_score.values
-
+        if timer: timer.add('get_branching_decision.update_bounds')
         if method == 'kfsb':
             for v in sps.values():
                 for kk, vv in v.items():
@@ -231,7 +235,12 @@ class KfsbBranching(BabsrBranching):
                               range(split_depth)]  # change the order of final decision to split_depth * batch
             final_decision = sum(final_decision, [])
 
-            return final_decision, None, split_depth  # None for points
+            return BranchingDecisions(
+                branching_decision=final_decision,
+                branching_points=None,
+                split_depth=split_depth,
+                batch_size=batch,
+            )
         else:
             # keep all the k decisions
             # final_decision: batch -> k splits
@@ -272,4 +281,9 @@ class KfsbBranching(BabsrBranching):
             if random_decision_dict:
                 print(f'Random branching decision used for {{example_idx:n_random}}: {random_decision_dict}')
 
-            return final_decision, None, split_depth  # None for points
+            return BranchingDecisions(
+                branching_decision=final_decision,
+                branching_points=None,
+                split_depth=split_depth,
+                batch_size=batch,
+            )

@@ -65,7 +65,7 @@ specification:
   rhs_offset: null  # Adding an offset to RHS.
 solver:
   batch_size: 64  # Batch size in bound solver (number of parallel splits).
-  auto_enlarge_batch_size: true  # Automatically increase batch size based on --batch_size in bab if current VRAM usage < 45%%, only support input_split.
+  auto_enlarge_batch_size: true  # Disable automatic increase of batch size based on --batch_size in bab when current VRAM usage < 45%%; only supports input_split.
   batched_crown_auto_enlarge_max_vram_ratio: 0.9  # Automatically increase batch size based on --batch_size in bab if current VRAM usage < (batched_crown_auto_enlarge_max_vram_ratio / 2)%%, only support batched crown.
   min_batch_size_ratio: 0.1  # The minimum batch size ratio in each iteration (splitting multiple layers if the number of domains is smaller than min_batch_size_ratio * batch_size).
   use_float64_in_last_iteration: false  # Use double fp (float64) at the last iteration in alpha/beta CROWN.
@@ -147,7 +147,6 @@ bab:
   optimized_interm: ''  # A list of layer names that will be optimized during branch and bound, separated by comma.
   recompute_interm: false  # Recompute all the intermediate bounds during BaB.
   sort_domain_interval: -1  # If unsorted domains are used, sort the domains every sort_domain_interval iterations.
-  vanilla_crown: false  # Use vanilla CROWN during BaB.
   tree_traversal: depth_first  # During BaB, unknown domains can continue being split (deepening the tree, i.e. depth first traversal) or split only when all other unknown domains have the same number of splits (keeping the tree shallow for as long as possible, i.e. breadth first traversal). Depth first traversal minimizes memory access time, breadth first traversal is beneficial for BICCOS.
   hugetensor_allocator: true  # Use the default tensor allocator instead of the HugeTensor allocator.
   cut:
@@ -170,6 +169,8 @@ bab:
     cut_reference_bounds: true  # Enable/disable using reference bounds when GCP-CROWN cuts are used.
     fix_intermediate_bounds: false  # Fix intermediate bounds when GCP-CROWN cuts are used.
     manual_cuts: null  # Feed manual cuts using this argument. The cut file should be named xxx.cuts.
+    record_cplex_cut_to: null  # Path to CSV file for recording CPLEX cuts for replay. If specified, all cuts fetched from CPLEX will be saved. The batch ID will be automatically appended to the filename (e.g., cut_records.csv becomes cut_records_batch_0.csv). Pickle files will be saved in a folder next to the CSV file.
+    read_cplex_cut_from: null  # Path to CSV file for reading CPLEX cuts for replay. If specified, cuts will be replayed from this CSV file instead of fetching from CPLEX. The batch ID will be automatically appended to the filename (e.g., cut_records.csv becomes cut_records_batch_0.csv).
     biccos:
       enabled: false  # BICCOS z cuts from the Branch and Bound process.
       auto_param: true  # BICCOS auto start the mts and set parameters.
@@ -208,6 +209,7 @@ bab:
     branching_input_and_activation_order: [input, relu]  # Order of branching input domains and relu domains (experimental).
     branching_input_iterations: 30  # Number of iterations to run input split before we run relu split.
     branching_relu_iterations: 50  # Number of iterations to run relu split before we run input split.
+    save_visited_domains_to: ''  # Save visited domains to the specified path for visualization.
     nonlinear_split:
       method: bbps  # Branching heuristic for the general nonlinear functions (either the default BBPS heuristic, or a BaBSR-like as a baseline).
       disable: false  # Disable GenBaB even if there are non-ReLU functions to split.
@@ -254,6 +256,8 @@ bab:
       show_progress: false  # Show progress during input split.
       presplit_domains: null  # Load pre-split domains from a file.
       skip_getting_worst_domain: false  # Skip getting the worst domain at the end of each iteration, to save some time cost when the domain list is long.
+  branching_decision_precompute:
+    enable: true  # Try to enable branching decision precomputing.
   attack:
     enabled: false  # Enable beam search based BaB-attack.
     beam_candidates: 8  # Number of candidates in beam search.
@@ -303,3 +307,6 @@ debug:
   view_model: false  # Print more detailed model information for analysis.
   save_minimal_config: null  # Path to save a minimal config file.
   save_minimal_config_omit_keys: []  # Keys to omit from the minimal config file.
+solving:
+  solving_mode: false  # Enable solving mode.
+  obj_index: 0  # The index of the objective in the output.

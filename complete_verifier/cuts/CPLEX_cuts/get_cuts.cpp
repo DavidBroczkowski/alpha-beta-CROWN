@@ -6,12 +6,20 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string> // for string class
+#include <cstdlib>   // std::getenv
+#include <optional>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
 
 using namespace std;
+
+std::optional<std::string> getenv_str(const char* name) {
+    const char* v = std::getenv(name);
+    if (v) return std::string(v);
+    return std::nullopt;
+}
 
 /* Declarations for functions in this program */
 
@@ -391,9 +399,19 @@ main (int  argc,
    if ( status )  goto TERMINATE;
 
    /* Allow non-deterministic result. Disable it for reproducibility.*/
+   {
+       auto det_mode = getenv_str("CUT_CPLEX_DETERMINISTIC");
+       if (det_mode.has_value() && det_mode.value() == "1") {
+           status = CPXXsetintparam (env, CPXPARAM_Parallel, CPX_PARALLEL_DETERMINISTIC);
+           if ( status )  goto TERMINATE;
+           status = CPXXsetintparam(env, CPXPARAM_RandomSeed, 42);
+           if ( status )  goto TERMINATE;
 
-   status = CPXXsetcntparam (env, CPXPARAM_Parallel, CPX_PARALLEL_OPPORTUNISTIC);
-   if ( status )  goto TERMINATE;
+       } else {
+           status = CPXXsetcntparam (env, CPXPARAM_Parallel, CPX_PARALLEL_OPPORTUNISTIC);
+           if ( status )  goto TERMINATE;
+       }
+   }
 
    // TODO: warm-start the solver with known best adversarial candidates.
 

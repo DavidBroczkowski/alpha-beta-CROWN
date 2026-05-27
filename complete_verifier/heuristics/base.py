@@ -1,7 +1,7 @@
 #########################################################################
 ##   This file is part of the α,β-CROWN (alpha-beta-CROWN) verifier    ##
 ##                                                                     ##
-##   Copyright (C) 2021-2025 The α,β-CROWN Team                        ##
+##   Copyright (C) 2021-2026 The α,β-CROWN Team                        ##
 ##   Team leaders:                                                     ##
 ##          Faculty:   Huan Zhang <huan@huan-zhang.com> (UIUC)         ##
 ##          Student:   Xiangru Zhong <xiangru4@illinois.edu> (UIUC)    ##
@@ -17,6 +17,7 @@
 import torch
 
 from typing import TYPE_CHECKING
+from heuristics.decision_types import BranchingDecisions
 if TYPE_CHECKING:
     from beta_CROWN_solver import LiRPANet
 
@@ -44,7 +45,7 @@ class NeuronBranchingHeuristic():
         self.batch_size = first_bounds.size(0)
         self.device = first_bounds.device
 
-    def get_branching_decisions(self, domains, split_depth=1, **kwargs):
+    def compute_branching_decisions(self, domains, split_depth=1, **kwargs):
         r"""
         Get branching decisions given intermediate layer bounds and a mask
         indicating which neurons are "splittable".
@@ -176,6 +177,7 @@ class NeuronBranchingHeuristic():
         # TODO: return two tensors, not list. Avoid a lot of for loops later.
         # return layers, indices
         # Shape is (batch, split_depth, 2)
+        batch_size = layers.size(0)
         decisions = (layers, indices)
         stacked_decisions = torch.stack(decisions, dim=-1)
         # FIXME: so far the returned shape is very bad, mixing shape and depth.
@@ -191,7 +193,12 @@ class NeuronBranchingHeuristic():
                 points = points.reshape(-1)
             else:
                 points = points.reshape(-1, points.size(-1))
-        return stacked_decisions, points, split_depth
+        return BranchingDecisions(
+            branching_decision=stacked_decisions,
+            branching_points=points,
+            split_depth=split_depth,
+            batch_size=batch_size,
+        )
 
     def compute_neuron_scores(self, domains, **kwargs):
         """To-be implemented by instances of this abstract class."""
