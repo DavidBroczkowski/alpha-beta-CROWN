@@ -1405,7 +1405,7 @@ class AbcrownDNFSolver:
                     net, dummy, onnx_path,
                     input_names=['input'], output_names=['output'],
                     dynamic_axes={'input': {0: 'batch'}, 'output': {0: 'batch'}},
-                    opset_version=13
+                    opset_version=18
                 )
 
             with open(vnnlib_path, 'w') as f:
@@ -1595,7 +1595,7 @@ class AbcrownDNFSolver:
                 net, dummy, onnx_path,
                 input_names=['input'], output_names=['output'],
                 dynamic_axes={'input': {0: 'batch'}, 'output': {0: 'batch'}},
-                opset_version=13
+                opset_version=18
             )
 
         # Enforce domains for restricted ops (log, sqrt).

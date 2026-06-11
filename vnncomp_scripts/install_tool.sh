@@ -4,8 +4,9 @@
 
 TOOL_NAME=alpha-beta-CROWN
 VERSION_STRING=v1
+UV_ENV_DIR=${HOME}/UV_ENVS/alpha-beta-crown
 if [[ -z "${VNNCOMP_PYTHON_PATH}" ]]; then
-	VNNCOMP_PYTHON_PATH=/home/ubuntu/miniconda/envs/alpha-beta-crown/bin
+	VNNCOMP_PYTHON_PATH=${UV_ENV_DIR}/bin
 fi
 
 # check arguments
@@ -31,18 +32,14 @@ sudo systemctl mask cron.service chrony.service multipathd.service multipathd.so
 grep AMD /proc/cpuinfo > /dev/null && echo "export MKL_DEBUG_CPU_TYPE=5" >> ${HOME}/.profile
 echo "export OMP_NUM_THREADS=1" >> ${HOME}/.profile
 
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-sh miniconda.sh -b -p ${HOME}/miniconda
-echo 'export PATH=${PATH}:'${HOME}'/miniconda/bin' >> ~/.profile
-echo "alias py37=\"source activate alpha-beta-crown\"" >> ${HOME}/.profile
-export PATH=${PATH}:$HOME/miniconda/bin
-
-# Accept anaconda channel terms (required since July 15, 2025)
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+# Install uv (https://docs.astral.sh/uv/)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+echo 'export PATH=${PATH}:'${HOME}'/.local/bin' >> ~/.profile
+echo "alias py37=\"source ${UV_ENV_DIR}/bin/activate\"" >> ${HOME}/.profile
+export PATH=${PATH}:$HOME/.local/bin
 
 # Install NVIDIA driver
-DRIVER_VERSION=570.169
+DRIVER_VERSION=610.43.02
 aria2c -x 10 -s 10 -k 1M https://us.download.nvidia.com/XFree86/Linux-x86_64/$DRIVER_VERSION/NVIDIA-Linux-x86_64-$DRIVER_VERSION.run
 sudo nvidia-smi -pm 0
 chmod +x ./NVIDIA-Linux-x86_64-$DRIVER_VERSION.run
@@ -54,8 +51,15 @@ sudo nvidia-smi -pm 1
 # Make sure GPU shows up.
 nvidia-smi
 
-# Install conda environment
-${HOME}/miniconda/bin/conda env create --name alpha-beta-crown -f ${TOOL_DIR}/complete_verifier/environment_pyt260.yaml
+# Create uv virtualenv and sync dependencies from pyproject.toml (repo root)
+mkdir -p ${HOME}/UV_ENVS
+uv venv --python 3.11 ${UV_ENV_DIR}
+(cd ${TOOL_DIR} && VIRTUAL_ENV=${UV_ENV_DIR} uv sync --active)
+
+# Install Gurobi 13 only for its command line tool. real solver is specified in the pyproject.toml.
+aria2c -x 10 -s 10 -k 1M https://packages.gurobi.com/13.0/gurobi13.0.2_linux64.tar.gz
+tar -xzf gurobi13.0.2_linux64.tar.gz
+mv gurobi1302 ${HOME}/gurobi1302
 
 # Install CPLEX
 aria2c -x 10 -s 10 -k 1M "http://d.huan-zhang.com/storage/programs/cplex_studio2211.linux_x86_64.bin"
@@ -70,15 +74,16 @@ sudo ./cplex_studio2211.linux_x86_64.bin -f response.txt
 make -C ${TOOL_DIR}/complete_verifier/cuts/CPLEX_cuts/
 
 echo "Checking python requirements (it might take a while...)"
-if [ "$(${VNNCOMP_PYTHON_PATH}/python -c 'import torch; print(torch.__version__)')" != '2.6.0+cu124' ]; then
-    echo "Unsupported PyTorch version"
+TORCH_VERSION=$(${VNNCOMP_PYTHON_PATH}/python -c 'import torch; print(torch.__version__)')
+if [[ "${TORCH_VERSION}" != 2.11.0* ]]; then
+    echo "Unsupported PyTorch version: ${TORCH_VERSION}"
     echo "Installation Failure!"
     exit 1
 fi
 
 
 # Setup Gurobi
-grbprobe_output=$(${VNNCOMP_PYTHON_PATH}/grbprobe)
+grbprobe_output=$(${HOME}/gurobi1302/linux64/bin/grbprobe)
 echo $grbprobe_output
 
 HOSTNAME=$(echo $grbprobe_output | grep -Po "(?<=HOSTNAME=)(.*?)(?= )")

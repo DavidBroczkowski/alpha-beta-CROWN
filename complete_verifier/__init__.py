@@ -15,7 +15,7 @@
 import sys
 import os
 
-__version__ = '0.7.0'
+__version__ = '0.7.2'
 
 print("Adding complete_verifier to sys.path")
 sys.path = [os.path.dirname(__file__)] + sys.path

@@ -2,10 +2,6 @@
 
 # Script for setting up Gurobi after running install_tool.sh
 
-if [[ -z "${VNNCOMP_PYTHON_PATH}" ]]; then
-	VNNCOMP_PYTHON_PATH=/home/ubuntu/miniconda/envs/alpha-beta-crown/bin
-fi
-
 # Get the license from the url which is the final output of install_tool.sh
 # The url should be visited from a university network
 # Update the license below when the evaluation is paused
@@ -37,7 +33,7 @@ EOF
 sudo mkdir -p /opt/gurobi
 sudo mv gurobi.lic /opt/gurobi/
 
-gurobi_output=$(${VNNCOMP_PYTHON_PATH}/gurobi_cl)
+gurobi_output=$(${HOME}/gurobi1302/linux64/bin/gurobi_cl)
 if grep -q "Using license file /opt/gurobi/gurobi.lic" <<< "$gurobi_output" && grep -q "Academic license" <<< "$gurobi_output"; then
 	echo "Gurobi license setup is successful!"
 else

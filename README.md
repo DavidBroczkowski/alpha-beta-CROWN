@@ -90,37 +90,41 @@ to find the most suitable example to get started.
 Installation and Setup
 ----------------------
 
-α,β-CROWN is tested on Python 3.11 and PyTorch 2.8.0 (recent versions may also work).
-It can be installed
-easily into a conda environment. If you don't have conda, you can install
-[miniconda](https://docs.conda.io/en/latest/miniconda.html).
+α,β-CROWN is tested on Python 3.11 and PyTorch 2.11 (recent versions may also work).
+We use [`uv`](https://docs.astral.sh/uv/) for installation (Requirement: CUDA>=12.6).
+
+Install `uv`:
+```bash
+# Install uv.
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
 Clone our verifier including the [auto_LiRPA](https://github.com/Verified-Intelligence/auto_LiRPA) submodule:
 ```bash
 git clone --recursive https://github.com/Verified-Intelligence/alpha-beta-CROWN.git
+cd alpha-beta-CROWN
 ```
 
-Setup the conda environment from [`environment.yaml`](complete_verifier/environment.yaml)
-with pinned dependencies versions (CUDA>=12.8 is required):
+Then create the environment and install all dependencies.
+
 ```bash
-# Remove the old environment, if necessary.
-conda deactivate; conda env remove --name alpha-beta-crown
-# install all dependents into the alpha-beta-crown environment
-conda env create -f complete_verifier/environment.yaml --name alpha-beta-crown
-# activate the environment
-conda activate alpha-beta-crown
+uv sync
+# Activate the environment.
+source .venv/bin/activate
 ```
 
-Alternatively, you may use `pip`
-(if you want to add α,β-CROWN to your existing environment,
-or if your system is not compatible with [`environment.yaml`](complete_verifier/environment.yaml)).
-It is highly recommended to have a pre-installed PyTorch that matches your system and our version requirement
-(see [PyTorch Get Started](https://pytorch.org/get-started)).
-Then, you can run:
+If you use NVIDIA Volta GPUs eg. `V100` or encountered `CUDA error: no kernel image is available for execution on the device`, please downgrade to PyTorch 2.11.0 with CUDA 12.6.
+
 ```bash
-(cd auto_LiRPA; pip install -e .)
-pip install -r complete_verifier/requirements.txt
+uv pip install --reinstall torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
+
+Alternatively, you could also install via pip (if you want to add α,β-CROWN to your existing environment):
+```bash
+cd alpha-beta-CROWN
+pip install .
+```
+
 
 Unless you use MIP-based verification algorithms, a Gurobi license is *not needed* (in most use cases).
 If you want to use MIP-based verification algorithms (which are feasible only for small models), you need to
@@ -148,7 +152,7 @@ for the verifier are defined in a `yaml` config file. For example, to run
 robustness verification on a CIFAR-10 ResNet network, you just run:
 
 ```bash
-conda activate alpha-beta-crown  # activate the conda environment
+source .venv/bin/activate  # activate the uv environment
 cd complete_verifier
 python abcrown.py --config exp_configs/tutorial_examples/cifar_resnet_2b.yaml
 ```
